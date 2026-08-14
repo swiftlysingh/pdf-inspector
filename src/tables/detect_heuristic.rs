@@ -2010,9 +2010,44 @@ pub(crate) fn find_first_table_row(
 
     // Collect item indices from excluded rows
     if first_table_row > 0 {
+        let first_retained_row = cell_items.get(first_table_row);
+        let first_retained_row_is_transaction = first_retained_row.is_some_and(|row| {
+            let mut cells = row
+                .iter()
+                .map(|cell| join_cell_items(cell))
+                .filter(|cell| !cell.is_empty());
+            let first = cells.next().unwrap_or_default();
+            let last = cells.next_back().unwrap_or_else(|| first.clone());
+            let first_is_date = first.len() <= 10
+                && first.chars().filter(|c| c.is_ascii_digit()).count() >= 4
+                && (first.contains('/') || first.contains('-'));
+            let last_is_amount = last.chars().any(|c| "$€£¥".contains(c))
+                && last.chars().any(|c| c.is_ascii_digit());
+            first_is_date && last_is_amount
+        });
+        let first_retained_row_is_complete = first_retained_row
+            .map(|row| row.iter().map(Vec::len).sum::<usize>())
+            .filter(|&assigned| assigned > 0)
+            .is_some_and(|assigned| {
+                let candidates = original_items
+                    .iter()
+                    .filter(|(_, item)| find_row_index(rows, item.y) == Some(first_table_row))
+                    .count();
+                assigned == candidates
+            });
         let y_tolerance = 15.0;
         for (idx, item) in original_items {
-            // Check if this item is in one of the excluded rows
+            // A broad proximity check can also match the first retained data
+            // row when compact table rows are less than 15pt apart. Preserve
+            // a transaction row only when the grid captured it completely;
+            // partial rows may intentionally flow through as surrounding
+            // content.
+            if first_retained_row_is_transaction
+                && first_retained_row_is_complete
+                && find_row_index(rows, item.y) == Some(first_table_row)
+            {
+                continue;
+            }
             for row_y in rows.iter().take(first_table_row) {
                 if (item.y - *row_y).abs() < y_tolerance {
                     excluded_items.insert(*idx);
@@ -2153,6 +2188,27 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn excluded_form_rows_do_not_claim_nearby_first_data_row() {
+        let items = vec![
+            make_item("Account:", 50.0, 100.0, 8.5, 35.0),
+            make_item("Detail:", 150.0, 100.0, 8.5, 30.0),
+            make_item("04/21/26", 50.0, 88.0, 8.5, 35.0),
+            make_item("$17.01", 150.0, 88.0, 8.5, 30.0),
+        ];
+        let cell_items = vec![
+            vec![vec![&items[0]], vec![&items[1]]],
+            vec![vec![&items[2]], vec![&items[3]]],
+        ];
+        let original_items: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+
+        let (first_table_row, excluded) =
+            find_first_table_row(&cell_items, &[100.0, 88.0], &original_items);
+
+        assert_eq!(first_table_row, 1);
+        assert_eq!(excluded, std::collections::HashSet::from([0, 1]));
     }
 
     #[test]
