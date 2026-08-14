@@ -2077,10 +2077,15 @@ impl FontCMaps {
                 skip_truetype_fallback,
             );
 
-            if !skip_truetype_fallback {
-                // Fonts inside Form XObjects referenced by this page
-                Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
-            }
+            // Fonts inside Form XObjects referenced by this page. Fast mode
+            // still loads primary ToUnicode maps while skipping expensive
+            // embedded-font fallbacks.
+            Self::collect_cmaps_from_xobjects(
+                doc,
+                page_id,
+                &mut by_obj_num,
+                skip_truetype_fallback,
+            );
         }
 
         FontCMaps { by_obj_num }
@@ -2089,14 +2094,6 @@ impl FontCMaps {
     /// Parse ToUnicode CMaps from a set of font dictionaries.
     /// Also handles Identity-H/V CID fonts without ToUnicode by parsing
     /// the embedded TrueType cmap from FontFile2.
-    fn collect_cmaps_from_fonts(
-        fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
-        doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
-    ) {
-        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
-    }
-
     fn collect_cmaps_from_fonts_inner(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
@@ -2439,6 +2436,7 @@ impl FontCMaps {
         doc: &Document,
         page_id: ObjectId,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
+        skip_truetype_fallback: bool,
     ) {
         let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
             Ok(r) => r,
@@ -2448,11 +2446,23 @@ impl FontCMaps {
         let mut visited = HashSet::new();
 
         if let Some(resources) = resource_dict {
-            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            Self::walk_xobject_fonts(
+                resources,
+                doc,
+                by_obj_num,
+                &mut visited,
+                skip_truetype_fallback,
+            );
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+                Self::walk_xobject_fonts(
+                    resources,
+                    doc,
+                    by_obj_num,
+                    &mut visited,
+                    skip_truetype_fallback,
+                );
             }
         }
     }
@@ -2463,6 +2473,7 @@ impl FontCMaps {
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
         visited: &mut HashSet<ObjectId>,
+        skip_truetype_fallback: bool,
     ) {
         let xobject_dict = match resources.get(b"XObject") {
             Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
@@ -2494,8 +2505,14 @@ impl FontCMaps {
             if !is_form {
                 continue;
             }
-            // Collect fonts from this Form XObject's Resources
-            if let Ok(form_resources) = stream.dict.get(b"Resources").and_then(Object::as_dict) {
+            // Collect fonts from this Form XObject's Resources. PDFlib and
+            // other producers commonly store the dictionary indirectly.
+            let form_resources = match stream.dict.get(b"Resources") {
+                Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
+                Ok(Object::Dictionary(dict)) => Some(dict),
+                _ => None,
+            };
+            if let Some(form_resources) = form_resources {
                 // Extract font dict from the Form's resources
                 let font_dict_obj = match form_resources.get(b"Font") {
                     Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
@@ -2514,10 +2531,21 @@ impl FontCMaps {
                             fonts.insert(name.clone(), font);
                         }
                     }
-                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
+                    Self::collect_cmaps_from_fonts_inner(
+                        &fonts,
+                        doc,
+                        by_obj_num,
+                        skip_truetype_fallback,
+                    );
                 }
                 // Recurse into nested XObjects
-                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+                Self::walk_xobject_fonts(
+                    form_resources,
+                    doc,
+                    by_obj_num,
+                    visited,
+                    skip_truetype_fallback,
+                );
             }
         }
     }
@@ -2661,6 +2689,80 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
+
+    #[test]
+    fn loads_cmap_from_form_with_indirect_resources() {
+        let mut doc = Document::new();
+        let cmap_id = doc.add_object(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              1 beginbfchar\n<0001><0041>\nendbfchar\n"
+                .to_vec(),
+        ));
+        let font_id = doc.add_object(lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "Encoding" => "Identity-H",
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let form_resources_id = doc.add_object(lopdf::dictionary! {
+            "Font" => lopdf::dictionary! { "F1" => Object::Reference(font_id) },
+        });
+        let form_id = doc.add_object(lopdf::Stream::new(
+            lopdf::dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => Object::Reference(form_resources_id),
+            },
+            b"BT /F1 12 Tf 10 20 Td <0001> Tj ET".to_vec(),
+        ));
+        let content_id = doc.add_object(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"/X1 Do".to_vec(),
+        ));
+        let page_id = doc.add_object(lopdf::dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => lopdf::dictionary! {
+                "XObject" => lopdf::dictionary! { "X1" => Object::Reference(form_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(lopdf::dictionary! {
+            "Type" => "Pages",
+            "Count" => 1,
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(lopdf::dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let normal = FontCMaps::from_doc(&doc);
+        let fast = FontCMaps::from_doc_pages_fast(&doc, None);
+        for cmaps in [&normal, &fast] {
+            let entry = cmaps
+                .get_by_obj(cmap_id.0)
+                .expect("Form font CMap should load through indirect Resources");
+            assert_eq!(entry.primary.lookup(1), Some("A".to_string()));
+
+            let ((items, _, _), _, _, _) =
+                crate::extractor::content_stream::extract_page_text_items(
+                    &doc,
+                    page_id,
+                    1,
+                    cmaps,
+                    false,
+                    &mut crate::extractor::FontStyleCache::new(),
+                    &mut crate::extractor::FormWalkBudget::new(),
+                )
+                .expect("Form text extraction should succeed");
+            assert!(items.iter().any(|item| item.text == "A"));
+        }
+    }
 
     #[test]
     fn test_parse_bfchar_2byte() {
