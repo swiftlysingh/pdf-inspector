@@ -2212,6 +2212,28 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_nearby_first_data_row_remains_excluded() {
+        let items = vec![
+            make_item("Account:", 50.0, 100.0, 8.5, 35.0),
+            make_item("Detail:", 150.0, 100.0, 8.5, 30.0),
+            make_item("04/21/26", 50.0, 88.0, 8.5, 35.0),
+            make_item("Merchant", 100.0, 88.0, 8.5, 40.0),
+            make_item("$17.01", 150.0, 88.0, 8.5, 30.0),
+        ];
+        let cell_items = vec![
+            vec![vec![&items[0]], vec![&items[1]]],
+            vec![vec![&items[2]], vec![&items[4]]],
+        ];
+        let original_items: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+
+        let (first_table_row, excluded) =
+            find_first_table_row(&cell_items, &[100.0, 88.0], &original_items);
+
+        assert_eq!(first_table_row, 1);
+        assert_eq!(excluded, std::collections::HashSet::from([0, 1, 2, 3, 4]));
+    }
+
+    #[test]
     fn script_attachment_detects_subscript_after_body_text() {
         let body = make_item("log", 100.0, 500.0, 10.0, 15.0);
         let sub = make_item("10", 115.5, 497.0, 7.0, 7.0);
