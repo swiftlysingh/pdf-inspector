@@ -409,6 +409,7 @@ mod tests {
             layout: pdf_inspector::LayoutComplexity::default(),
             has_encoding_issues: false,
             cmap_gaps: Vec::new(),
+            structured_document: None,
         };
         assert_eq!(
             format_document_info(&result),

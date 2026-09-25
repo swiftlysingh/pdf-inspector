@@ -43,6 +43,7 @@ pub mod markdown;
 mod overlong_numerals;
 pub mod process_mode;
 pub mod structure_tree;
+pub mod structured;
 pub mod tables;
 mod text_quality;
 pub mod text_utils;
@@ -69,6 +70,11 @@ pub use markdown::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
+pub use structured::{
+    StructuredBlock, StructuredBlockContent, StructuredBounds, StructuredCellRole,
+    StructuredCellState, StructuredDocument, StructuredPage, StructuredPageSize,
+    StructuredPageStatus, StructuredTableCell, StructuredTextLine,
+};
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
@@ -232,6 +238,9 @@ pub struct PdfProcessResult {
     /// empty in [`ProcessMode::DetectOnly`], which decodes no text;
     /// otherwise empty when every such code had an entry.
     pub cmap_gaps: Vec<FontCMapGaps>,
+    /// Source-preserving page, block, line, and table capture. This is present
+    /// only when [`PdfOptions::capture_structured_output`] is enabled.
+    pub structured_document: Option<StructuredDocument>,
 }
 
 // =========================================================================
@@ -262,6 +271,10 @@ pub struct PdfOptions {
     /// Password for decrypting an encrypted PDF. `None` falls back to the
     /// empty password (owner-only encryption).
     pub password: Option<String>,
+    /// Capture page-local text/table structure alongside Markdown. This shares
+    /// the existing loaded document, extraction, table detection, and reading
+    /// order pipeline; it does not parse Markdown or re-open the PDF.
+    pub capture_structured_output: bool,
 }
 
 // Manual `Debug` so the password is never leaked through debug logging or a
@@ -274,6 +287,7 @@ impl std::fmt::Debug for PdfOptions {
             .field("markdown", &self.markdown)
             .field("page_filter", &self.page_filter)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("capture_structured_output", &self.capture_structured_output)
             .finish()
     }
 }
@@ -286,6 +300,7 @@ impl Default for PdfOptions {
             markdown: MarkdownOptions::default(),
             page_filter: None,
             password: None,
+            capture_structured_output: false,
         }
     }
 }
@@ -331,6 +346,12 @@ impl PdfOptions {
     /// Set the password used to decrypt an encrypted PDF.
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
+        self
+    }
+
+    /// Include source-preserving structured output in [`PdfProcessResult`].
+    pub fn capture_structured_output(mut self) -> Self {
+        self.capture_structured_output = true;
         self
     }
 }
@@ -4577,6 +4598,32 @@ fn process_document(
     options: PdfOptions,
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
+    if let Some(page) = options.page_filter.as_ref().and_then(|pages| {
+        pages
+            .iter()
+            .copied()
+            .filter(|page| *page == 0 || *page > page_count)
+            .min()
+    }) {
+        return Err(PdfError::PageOutOfRange { page, page_count });
+    }
+
+    // Keep selected pages in source order. `page_filter` is a HashSet for
+    // fast extraction membership checks, so iterating it would make the
+    // public structured page order nondeterministic.
+    let processed_pages: Vec<u32> = (1..=page_count)
+        .filter(|page| {
+            options
+                .page_filter
+                .as_ref()
+                .is_none_or(|filter| filter.contains(page))
+        })
+        .collect();
+    let mut page_geometries = options
+        .capture_structured_output
+        .then(|| structured::page_geometries(&doc, &processed_pages))
+        .transpose()?;
+
     // Step 1 — Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
     let pdf_type = detection.pdf_type;
@@ -4594,6 +4641,7 @@ fn process_document(
 
     // DetectOnly → return immediately
     if options.mode == ProcessMode::DetectOnly {
+        let status_by_page = structured_statuses(&processed_pages, &pages_needing_ocr, false);
         return Ok(PdfProcessResult {
             pdf_type,
             markdown: None,
@@ -4613,11 +4661,15 @@ fn process_document(
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
             cmap_gaps: Vec::new(),
+            structured_document: page_geometries
+                .as_ref()
+                .map(|geometries| structured::empty_document(geometries, &status_by_page)),
         });
     }
 
     // Scanned / ImageBased → nothing to extract
     if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
+        let status_by_page = structured_statuses(&processed_pages, &pages_needing_ocr, true);
         return Ok(PdfProcessResult {
             pdf_type,
             markdown: None,
@@ -4637,6 +4689,9 @@ fn process_document(
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
             cmap_gaps: Vec::new(),
+            structured_document: page_geometries
+                .as_ref()
+                .map(|geometries| structured::empty_document(geometries, &status_by_page)),
         });
     }
 
@@ -4690,8 +4745,11 @@ fn process_document(
         }
     };
 
-    // For Mixed PDFs, extraction failure is non-fatal
-    let extracted = if pdf_type == PdfType::Mixed {
+    // Legacy Markdown extraction treats an unavailable Mixed-PDF text layer
+    // as non-fatal. Structured capture must not turn an arbitrary extraction
+    // failure into an apparently successful empty document, so it preserves
+    // the normal throwing behavior.
+    let extracted = if pdf_type == PdfType::Mixed && !options.capture_structured_output {
         extracted.ok()
     } else {
         Some(extracted?)
@@ -4718,18 +4776,21 @@ fn process_document(
 
     let (
         markdown,
+        structured_blocks,
         layout,
         has_encoding_issues,
         gid_pages,
         text_quality_pages,
         text_quality_reasons_by_page,
         cmap_gaps,
+        structured_text_length,
+        structured_text_is_garbage,
     ) = match extracted {
         Some((
             (items, rects, lines),
             page_thresholds,
             gid_encoded_pages,
-            _page_rotations,
+            page_rotations,
             cmap_coverage,
         )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
@@ -4814,6 +4875,20 @@ fn process_document(
                 .into_iter()
                 .filter(|page| selected_page(*page))
                 .collect();
+            if let Some(geometries) = page_geometries.as_mut() {
+                for page in page_rotations
+                    .into_keys()
+                    .filter(|page| selected_page(*page))
+                {
+                    if let Some(geometry) = geometries.get_mut(&page) {
+                        // The extractor re-based these items for a
+                        // content-stream rotation heuristic. Keep their text,
+                        // but omit bounds because this geometry layer only
+                        // proves page-dictionary transforms.
+                        geometry.disable_bounds();
+                    }
+                }
+            }
             let FolioFilteredItems {
                 items,
                 layout_items,
@@ -4827,6 +4902,18 @@ fn process_document(
 
             let text_quality = analyze_text_quality(&items);
             merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
+            let structured_text = (options.mode == ProcessMode::Analyze
+                && options.capture_structured_output)
+                .then(|| {
+                    items
+                        .iter()
+                        .filter(|item| !matches!(item.item_type, types::ItemType::Image))
+                        .map(|item| item.text.as_str())
+                        .collect::<String>()
+                });
+            let structured_text_length = structured_text.as_ref().map(String::len);
+            let structured_text_is_garbage =
+                structured_text.as_deref().is_some_and(is_garbage_text);
             let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
             let layout = compute_layout_complexity_with_chart_regions(
                 &items,
@@ -4836,24 +4923,38 @@ fn process_document(
                 &chart_regions,
             );
 
-            let md = if options.mode == ProcessMode::Analyze {
-                None
-            } else {
-                Some(markdown::to_markdown_from_items_with_rects_and_lines(
-                    items,
-                    options.markdown,
-                    &rects,
-                    &lines,
-                    markdown::MarkdownDocumentContext {
-                        page_thresholds: &page_thresholds,
-                        struct_roles: struct_roles.as_ref(),
-                        struct_tables: &struct_tables,
-                        page_count,
-                        prefiltered_page_number_pages: Some(&removed_pages),
-                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
-                        precomputed_chart_regions: Some(&chart_regions),
-                    },
-                ))
+            let conversion =
+                if options.mode == ProcessMode::Analyze && !options.capture_structured_output {
+                    None
+                } else {
+                    Some(
+                    markdown::to_markdown_from_items_with_rects_and_lines_with_structured_capture(
+                        items,
+                        options.markdown,
+                        &rects,
+                        &lines,
+                        markdown::MarkdownDocumentContext {
+                            page_thresholds: &page_thresholds,
+                            struct_roles: struct_roles.as_ref(),
+                            struct_tables: &struct_tables,
+                            page_count,
+                            prefiltered_page_number_pages: Some(&removed_pages),
+                            prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                            precomputed_chart_regions: Some(&chart_regions),
+                        },
+                        page_geometries.as_ref(),
+                        options.mode != ProcessMode::Analyze,
+                    ),
+                )
+                };
+
+            let (md, structured_blocks) = match conversion {
+                Some(conversion) => {
+                    let structured_blocks = conversion.blocks_by_page;
+                    let md = (options.mode != ProcessMode::Analyze).then_some(conversion.markdown);
+                    (md, structured_blocks)
+                }
+                None => (None, None),
             };
 
             // A code no CMap could read is an encoding issue whether or not
@@ -4866,15 +4967,19 @@ fn process_document(
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,
+                structured_blocks,
                 layout,
                 enc,
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
                 font_cmap_gaps(cmap_coverage),
+                structured_text_length,
+                structured_text_is_garbage,
             )
         }
         None => (
+            None,
             None,
             LayoutComplexity::default(),
             false,
@@ -4882,14 +4987,20 @@ fn process_document(
             Vec::new(),
             BTreeMap::new(),
             Vec::new(),
+            None,
+            false,
         ),
     };
+
+    let extracted_text_is_garbage = markdown
+        .as_deref()
+        .map_or(structured_text_is_garbage, is_garbage_text);
 
     // If the extracted text is predominantly garbage (non-alphanumeric) and
     // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
     // layer comes from a bad OCR pass, and callers should use proper OCR.
     let (pdf_type, markdown, confidence) =
-        if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
+        if pdf_type == PdfType::Mixed && extracted_text_is_garbage {
             (PdfType::Scanned, None, 0.95)
         } else {
             (pdf_type, markdown, confidence)
@@ -4898,21 +5009,24 @@ fn process_document(
     // If a TextBased PDF produces garbage text, the fonts are undecodable
     // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
     // Drop the useless markdown and flag all pages for OCR.
-    let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
-        && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
-    {
-        log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
-        (None, true, true)
-    } else {
-        (markdown, has_encoding_issues, false)
-    };
+    let (markdown, has_encoding_issues, force_ocr_all) =
+        if pdf_type == PdfType::TextBased && extracted_text_is_garbage {
+            log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
+            (None, true, true)
+        } else {
+            (markdown, has_encoding_issues, false)
+        };
+
+    // Page-filtered requests make quality decisions over the selected pages.
+    // Keep page_count as the source document total for API compatibility.
+    let processed_page_count = processed_pages.len() as u32;
 
     // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list.
-    // When ALL pages have gid-encoded fonts, suppress unreliable markdown.
-    let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
+    // When ALL processed pages have gid-encoded fonts, suppress unreliable markdown.
+    let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= processed_page_count;
     let mut pages_needing_ocr = pages_needing_ocr;
     if force_ocr_all {
-        pages_needing_ocr = (1..=page_count).collect();
+        pages_needing_ocr = processed_pages.clone();
     }
     if !gid_pages.is_empty() {
         log::debug!("pages with gid-encoded fonts (need OCR): {:?}", gid_pages);
@@ -4940,33 +5054,49 @@ fn process_document(
     // Detect sparse extraction: when a TEXT-BASED PDF produces very few
     // characters per page, the text is likely embedded in images/forms
     // that need OCR.  Flag all pages for OCR in this case.
-    // Only check when markdown was actually generated (not in Analyze mode).
+    let extracted_text_length = markdown
+        .as_ref()
+        .map(String::len)
+        .or(structured_text_length);
     if pdf_type == PdfType::TextBased
-        && page_count > 0
+        && processed_page_count > 0
         && pages_needing_ocr.is_empty()
-        && markdown.is_some()
+        && extracted_text_length.is_some()
     {
-        let md_len = markdown.as_ref().map_or(0, |m| m.len());
-        let chars_per_page = md_len as f32 / page_count as f32;
-        if chars_per_page < 50.0 && md_len < 500 {
+        let text_length = extracted_text_length.unwrap_or_default();
+        let chars_per_page = text_length as f32 / processed_page_count as f32;
+        if chars_per_page < 50.0 && text_length < 500 {
             log::debug!(
                 "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
                 chars_per_page,
-                page_count
+                processed_page_count
             );
-            pages_needing_ocr = (1..=page_count).collect();
+            pages_needing_ocr = processed_pages.clone();
         }
     }
 
     let markdown = if all_gid {
         log::debug!(
             "all {} pages have gid-encoded fonts — suppressing markdown output",
-            page_count
+            processed_page_count
         );
         None
     } else {
         markdown
     };
+
+    let status_by_page = structured_statuses(
+        &processed_pages,
+        &pages_needing_ocr,
+        matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased),
+    );
+    let structured_document = page_geometries.as_ref().map(|geometries| {
+        structured::document_from_blocks(
+            geometries,
+            structured_blocks.unwrap_or_default(),
+            &status_by_page,
+        )
+    });
 
     Ok(PdfProcessResult {
         pdf_type,
@@ -4994,6 +5124,7 @@ fn process_document(
         layout,
         has_encoding_issues,
         cmap_gaps,
+        structured_document,
     })
 }
 
@@ -5015,6 +5146,26 @@ fn font_cmap_gaps(coverage: types::CMapCoverageByFont) -> Vec<FontCMapGaps> {
 // =========================================================================
 // Internal helpers
 // =========================================================================
+
+fn structured_statuses(
+    pages: &[u32],
+    pages_needing_ocr: &[u32],
+    all_pages_need_ocr: bool,
+) -> HashMap<u32, StructuredPageStatus> {
+    let ocr_pages: HashSet<u32> = pages_needing_ocr.iter().copied().collect();
+    pages
+        .iter()
+        .copied()
+        .map(|page| {
+            let status = if all_pages_need_ocr || ocr_pages.contains(&page) {
+                StructuredPageStatus::NeedsOcr
+            } else {
+                StructuredPageStatus::Extracted
+            };
+            (page, status)
+        })
+        .collect()
+}
 
 fn suspected_garbled_reason() -> String {
     OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()
@@ -6860,6 +7011,8 @@ pub enum PdfError {
     InvalidStructure,
     #[error("Not a PDF: {0}")]
     NotAPdf(String),
+    #[error("Page {page} is outside the PDF's {page_count} pages")]
+    PageOutOfRange { page: u32, page_count: u32 },
 }
 
 impl From<lopdf::Error> for PdfError {
@@ -7279,6 +7432,38 @@ mod tests {
         assert_eq!(region.y, -90.0);
         assert_eq!(region.width, 200.0);
         assert_eq!(region.height, 120.0);
+    }
+
+    #[test]
+    fn analyze_structured_capture_skips_markdown() {
+        let pdf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+        let result = process_pdf_mem_with_options(
+            &pdf,
+            PdfOptions::new()
+                .mode(ProcessMode::Analyze)
+                .pages([1])
+                .capture_structured_output(),
+        )
+        .unwrap();
+
+        assert!(result.markdown.is_none());
+        assert!(result
+            .structured_document
+            .is_some_and(|document| document.pages.iter().any(|page| !page.blocks.is_empty())));
+    }
+
+    #[test]
+    fn full_structured_capture_preserves_markdown() {
+        let pdf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+        let plain = process_pdf_mem_with_options(&pdf, PdfOptions::new().pages([1])).unwrap();
+        let captured = process_pdf_mem_with_options(
+            &pdf,
+            PdfOptions::new().pages([1]).capture_structured_output(),
+        )
+        .unwrap();
+
+        assert_eq!(captured.markdown, plain.markdown);
+        assert!(captured.structured_document.is_some());
     }
 
     #[test]

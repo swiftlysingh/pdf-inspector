@@ -4,7 +4,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::structure_tree::StructRole;
-use crate::types::TextLine;
+use crate::tables::Table;
+use crate::types::{TextItem, TextLine};
 
 use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
@@ -44,6 +45,17 @@ pub(super) struct PositionedMarkdown {
     x: f32,
     markdown: String,
     chart_order: Option<ChartProseOrder>,
+    pub(super) captured_table: Option<CapturedTable>,
+}
+
+/// The raw table and its detector-local item collection, retained only for an
+/// opt-in structured capture. `Table::item_indices` address this exact item
+/// vector, so preserving it avoids reconstructing table associations from
+/// Markdown text later.
+#[derive(Debug, Clone)]
+pub(super) struct CapturedTable {
+    pub(super) table: Table,
+    pub(super) source_items: Vec<TextItem>,
 }
 
 impl PositionedMarkdown {
@@ -58,6 +70,28 @@ impl PositionedMarkdown {
             x,
             markdown,
             chart_order,
+            captured_table: None,
+        }
+    }
+
+    pub(super) fn table(
+        y: f32,
+        x: f32,
+        markdown: String,
+        chart_order: Option<ChartProseOrder>,
+        table: &Table,
+        source_items: &[TextItem],
+        capture_structured_output: bool,
+    ) -> Self {
+        Self {
+            y,
+            x,
+            markdown,
+            chart_order,
+            captured_table: capture_structured_output.then(|| CapturedTable {
+                table: table.clone(),
+                source_items: source_items.to_vec(),
+            }),
         }
     }
 }
@@ -87,7 +121,7 @@ fn chart_stream_position(
     (zone, column)
 }
 
-fn positioned_block_precedes_line(block: &PositionedMarkdown, line: &TextLine) -> bool {
+pub(super) fn positioned_block_precedes_line(block: &PositionedMarkdown, line: &TextLine) -> bool {
     let Some(order) = block.chart_order else {
         return block.y > line.y;
     };
@@ -154,6 +188,26 @@ fn positioned_blocks_for_page<'a>(
     }
     blocks.sort_by(compare_positioned_blocks);
     blocks
+}
+
+/// Table-only projection of the same positioned-block ordering used by the
+/// Markdown renderer. Structured capture does not expose image placeholders,
+/// but table/text ordering must not drift from the shared predicate.
+pub(super) fn positioned_tables_for_page(
+    page: u32,
+    page_tables: &HashMap<u32, Vec<PositionedMarkdown>>,
+) -> Vec<(usize, &PositionedMarkdown)> {
+    let mut tables: Vec<_> = page_tables
+        .get(&page)
+        .into_iter()
+        .flat_map(|tables| tables.iter().enumerate())
+        .collect();
+    tables.sort_by(|(left_index, left), (right_index, right)| {
+        let left = (PositionedBlockKind::Table, *left_index, *left);
+        let right = (PositionedBlockKind::Table, *right_index, *right);
+        compare_positioned_blocks(&left, &right)
+    });
+    tables
 }
 
 /// Pre-scan struct heading tags to find levels that are overused — i.e., tagged on

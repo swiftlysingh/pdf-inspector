@@ -2142,6 +2142,7 @@ fn test_pages_needing_ocr_field_accessible() {
         layout: pdf_inspector::LayoutComplexity::default(),
         has_encoding_issues: false,
         cmap_gaps: Vec::new(),
+        structured_document: None,
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
 }

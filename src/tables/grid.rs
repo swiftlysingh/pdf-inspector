@@ -685,6 +685,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            spans: vec![],
             kind: TableKind::Data,
         };
 
@@ -704,6 +705,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![0, 1],
+            spans: vec![],
             kind: TableKind::Data,
         };
 
@@ -729,6 +731,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            spans: vec![],
             kind: TableKind::Data,
         };
 
@@ -750,6 +753,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            spans: vec![],
             kind: TableKind::Data,
         };
 
@@ -771,6 +775,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![1, 2],
+            spans: vec![],
             kind: TableKind::Data,
         };
 
@@ -787,6 +792,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
 

@@ -1543,8 +1543,32 @@ pub struct Table {
     pub cells: Vec<Vec<String>>,
     /// Items that belong to this table
     pub item_indices: Vec<usize>,
+    /// Rectangle-backed merged-cell evidence. Only vertical spans are
+    /// currently established by the normal extraction path; callers must not
+    /// infer a horizontal span from an empty neighboring grid slot.
+    pub spans: Vec<TableSpan>,
     /// Data table vs TOC. Set by `Table::new` from `cells`.
     pub kind: TableKind,
+}
+
+/// A span anchored at one raw table grid cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableSpan {
+    pub row: usize,
+    pub column: usize,
+    pub row_span: usize,
+    pub column_span: usize,
+}
+
+impl TableSpan {
+    pub const fn single(row: usize, column: usize) -> Self {
+        Self {
+            row,
+            column,
+            row_span: 1,
+            column_span: 1,
+        }
+    }
 }
 
 impl Table {
@@ -1565,8 +1589,15 @@ impl Table {
             rows,
             cells,
             item_indices,
+            spans: Vec::new(),
             kind,
         }
+    }
+
+    /// Attach geometry-backed span evidence without changing the raw grid.
+    pub fn with_spans(mut self, spans: Vec<TableSpan>) -> Self {
+        self.spans = spans;
+        self
     }
 }
 
@@ -1727,6 +1758,7 @@ mod tests {
                 vec!["Cell 1".into(), "Cell 2".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
 
@@ -2509,6 +2541,7 @@ mod tests {
                 vec!["3".into(), "5/2".into(), "Item C".into(), "300".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
 

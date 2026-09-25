@@ -924,6 +924,7 @@ mod tests {
                 vec!["Bob".into(), "25".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -940,6 +941,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["Only".into(), "Row".into()]],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -957,6 +959,7 @@ mod tests {
                 vec!["Accuracy".into(), "95%".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         assert!(is_complete_data_table(&complete));
@@ -977,6 +980,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         assert_eq!(table_to_markdown(&table), "");
@@ -993,6 +997,7 @@ mod tests {
                 vec!["(1)".into(), "Footnote text".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -1009,6 +1014,7 @@ mod tests {
                 vec!["太郎".into(), "25".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -1023,6 +1029,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec![]],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         assert_eq!(table_to_markdown(&table), "");
