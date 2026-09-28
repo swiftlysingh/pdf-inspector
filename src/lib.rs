@@ -4641,7 +4641,7 @@ fn process_document(
 
     // DetectOnly → return immediately
     if options.mode == ProcessMode::DetectOnly {
-        let status_by_page = structured_statuses(&processed_pages, &pages_needing_ocr, false);
+        let status_by_page = structured_statuses(&processed_pages, &pages_needing_ocr);
         return Ok(PdfProcessResult {
             pdf_type,
             markdown: None,
@@ -4669,7 +4669,7 @@ fn process_document(
 
     // Scanned / ImageBased → nothing to extract
     if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
-        let status_by_page = structured_statuses(&processed_pages, &pages_needing_ocr, true);
+        let status_by_page = structured_statuses(&processed_pages, &pages_needing_ocr);
         return Ok(PdfProcessResult {
             pdf_type,
             markdown: None,
@@ -5025,7 +5025,7 @@ fn process_document(
     // When ALL processed pages have gid-encoded fonts, suppress unreliable markdown.
     let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= processed_page_count;
     let mut pages_needing_ocr = pages_needing_ocr;
-    if force_ocr_all {
+    if force_ocr_all || pdf_type == PdfType::Scanned {
         pages_needing_ocr = processed_pages.clone();
     }
     if !gid_pages.is_empty() {
@@ -5085,11 +5085,7 @@ fn process_document(
         markdown
     };
 
-    let status_by_page = structured_statuses(
-        &processed_pages,
-        &pages_needing_ocr,
-        matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased),
-    );
+    let status_by_page = structured_statuses(&processed_pages, &pages_needing_ocr);
     let structured_document = page_geometries.as_ref().map(|geometries| {
         structured::document_from_blocks(
             geometries,
@@ -5150,14 +5146,13 @@ fn font_cmap_gaps(coverage: types::CMapCoverageByFont) -> Vec<FontCMapGaps> {
 fn structured_statuses(
     pages: &[u32],
     pages_needing_ocr: &[u32],
-    all_pages_need_ocr: bool,
 ) -> HashMap<u32, StructuredPageStatus> {
     let ocr_pages: HashSet<u32> = pages_needing_ocr.iter().copied().collect();
     pages
         .iter()
         .copied()
         .map(|page| {
-            let status = if all_pages_need_ocr || ocr_pages.contains(&page) {
+            let status = if ocr_pages.contains(&page) {
                 StructuredPageStatus::NeedsOcr
             } else {
                 StructuredPageStatus::Extracted

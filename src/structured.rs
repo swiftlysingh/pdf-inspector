@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use lopdf::{Document, Object, ObjectId};
 use serde::Serialize;
 
+use crate::extractor::visible_page_box;
 use crate::structure_tree::StructRole;
 use crate::tables::{Table, TableKind, TableSpan};
 use crate::types::{TextItem, TextLine};
@@ -1147,35 +1148,14 @@ fn transform_point(geometry: PageGeometry, x: f32, y: f32) -> (f32, f32) {
 }
 
 fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry, PdfError> {
-    let visible_box = inherited_array(document, page_id, b"CropBox")
-        .or_else(|| inherited_array(document, page_id, b"MediaBox"))
-        .ok_or(PdfError::InvalidStructure)?;
-    if visible_box.len() < 4 {
-        return Err(PdfError::InvalidStructure);
-    }
-    let values: Vec<f32> = visible_box
-        .iter()
-        .take(4)
-        .map(number)
-        .collect::<Option<_>>()
-        .ok_or(PdfError::InvalidStructure)?;
-    let x0 = values[0].min(values[2]);
-    let y0 = values[1].min(values[3]);
-    let x1 = values[0].max(values[2]);
-    let y1 = values[1].max(values[3]);
-    let source_width = x1 - x0;
-    let source_height = y1 - y0;
-    if !(x0.is_finite()
-        && y0.is_finite()
-        && x1.is_finite()
-        && y1.is_finite()
-        && source_width.is_finite()
-        && source_height.is_finite()
-        && source_width > 0.0
-        && source_height > 0.0)
-    {
-        return Err(PdfError::InvalidStructure);
-    }
+    let visible_box = visible_page_box(document, page_id).ok_or(PdfError::InvalidStructure)?;
+    let (x0, y0, x1, y1) = (
+        visible_box.x0,
+        visible_box.y0,
+        visible_box.x1,
+        visible_box.y1,
+    );
+    let (source_width, source_height) = (visible_box.width(), visible_box.height());
     let rotation = inherited_object(document, page_id, b"Rotate")
         .as_ref()
         .and_then(|object| resolved_number(document, object))
@@ -1217,17 +1197,6 @@ fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry,
         size,
         bounds_available: true,
     })
-}
-
-fn inherited_array(document: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<Object>> {
-    match inherited_object(document, page_id, key)? {
-        Object::Array(values) => Some(values),
-        Object::Reference(reference) => match document.get_object(reference).ok()? {
-            Object::Array(values) => Some(values.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn inherited_object(document: &Document, page_id: ObjectId, key: &[u8]) -> Option<Object> {
