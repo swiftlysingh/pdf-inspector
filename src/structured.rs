@@ -10,7 +10,7 @@ use lopdf::{Document, Object, ObjectId};
 use serde::Serialize;
 
 use crate::structure_tree::StructRole;
-use crate::tables::{Table, TableSpan};
+use crate::tables::{Table, TableKind, TableSpan};
 use crate::types::{TextItem, TextLine};
 use crate::PdfError;
 
@@ -73,7 +73,16 @@ pub enum StructuredBlockContent {
         row_count: u32,
         column_count: u32,
         cells: Vec<StructuredTableCell>,
+        continuation_rows: Vec<StructuredTableContinuation>,
+        unassigned_lines: Vec<StructuredTextLine>,
     },
+}
+
+/// A physical detector row joined to an earlier row by shared layout cleanup.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct StructuredTableContinuation {
+    pub row: u32,
+    pub continuation_of: u32,
 }
 
 /// One extracted line before Markdown formatting or escaping.
@@ -309,7 +318,18 @@ pub(crate) fn table_block(
     let row_count = table.cells.len();
     let column_count = table.cells.iter().map(Vec::len).max().unwrap_or(0);
     let (mut cell_items, association_reliable) =
-        assign_table_items(table, source_items, row_count, column_count);
+        assign_table_items(table, source_items, row_count, column_count, geometry);
+    let unassigned_lines = if association_reliable {
+        Vec::new()
+    } else {
+        let claimed_items: Vec<TextItem> = table
+            .item_indices
+            .iter()
+            .filter_map(|&index| source_items.get(index).cloned())
+            .collect();
+        cell_items = vec![vec![Vec::new(); column_count]; row_count];
+        source_lines(&claimed_items, geometry)
+    };
     let spans = normalized_spans(&table.spans, row_count, column_count);
     let mut covered = HashSet::new();
     let mut span_at_anchor = HashMap::new();
@@ -398,7 +418,24 @@ pub(crate) fn table_block(
         }
     }
 
-    let bounds = union_bounds(cells.iter().filter_map(|cell| cell.bounds));
+    let bounds = union_bounds(
+        cells
+            .iter()
+            .filter_map(|cell| cell.bounds)
+            .chain(unassigned_lines.iter().filter_map(|line| line.bounds)),
+    );
+    let continuation_rows = if table.kind == TableKind::Toc {
+        Vec::new()
+    } else {
+        crate::tables::format::table_layout(&table.cells)
+            .continuation_rows
+            .into_iter()
+            .map(|(row, continuation_of)| StructuredTableContinuation {
+                row: row as u32,
+                continuation_of: continuation_of as u32,
+            })
+            .collect()
+    };
     StructuredBlock {
         id: String::new(),
         bounds,
@@ -406,6 +443,8 @@ pub(crate) fn table_block(
             row_count: row_count as u32,
             column_count: column_count as u32,
             cells,
+            continuation_rows,
+            unassigned_lines,
         },
     }
 }
@@ -448,7 +487,9 @@ fn source_lines(items: &[TextItem], geometry: PageGeometry) -> Vec<StructuredTex
     }
     grouped
         .into_iter()
-        .map(|items| {
+        .map(|mut items| {
+            let line_rtl = crate::text_utils::is_rtl_text(items.iter().map(|item| &item.text));
+            crate::text_utils::sort_line_items(&mut items, line_rtl);
             let line = TextLine {
                 y: items.first().map(|item| item.y).unwrap_or_default(),
                 page: items.first().map(|item| item.page).unwrap_or_default(),
@@ -478,16 +519,24 @@ fn assign_table_items(
     source_items: &[TextItem],
     row_count: usize,
     column_count: usize,
+    geometry: PageGeometry,
 ) -> (Vec<Vec<Vec<TextItem>>>, bool) {
-    let mut result = vec![vec![Vec::new(); column_count]; row_count];
     if row_count == 0 || column_count == 0 {
-        return (result, false);
+        return (vec![vec![Vec::new(); column_count]; row_count], false);
     }
-    let Some(rows) = table_axis(&table.rows, row_count) else {
-        return (result, false);
+    // The ruled-line detector is identifiable from its N + 1 column edges.
+    // It alone retains N leading row edges for N logical rows; other
+    // detectors retain anchors or centers, for which a shifted row band is
+    // only a hypothesis.
+    let rows_support_leading_edges = column_count
+        .checked_add(1)
+        .is_some_and(|edge_count| table.columns.len() == edge_count);
+    let Some(row_axes) = table_axis_candidates(&table.rows, row_count, rows_support_leading_edges)
+    else {
+        return (vec![vec![Vec::new(); column_count]; row_count], false);
     };
-    let Some(columns) = table_axis(&table.columns, column_count) else {
-        return (result, false);
+    let Some(column_axes) = table_axis_candidates(&table.columns, column_count, false) else {
+        return (vec![vec![Vec::new(); column_count]; row_count], false);
     };
     if table.item_indices.is_empty()
         && table
@@ -496,8 +545,129 @@ fn assign_table_items(
             .flatten()
             .any(|cell| !cell.trim().is_empty())
     {
-        return (result, false);
+        return (vec![vec![Vec::new(); column_count]; row_count], false);
     }
+
+    // N detector coordinates can be either source-item anchors or the leading
+    // edges of N physical grid bands. Prefer anchors, then use the raw cell
+    // strings only to disambiguate an equally valid geometry convention. The
+    // raw grid has no positioned item identities, so it cannot replace this
+    // association or reconstruct duplicate source occurrences on its own.
+    let mut best = assign_items_to_axes(
+        table,
+        source_items,
+        row_count,
+        column_count,
+        row_axes[0],
+        column_axes[0],
+    );
+    let mut best_score = raw_cell_match_score(&best.0, &table.cells, geometry);
+    let mut selected_axes = (row_axes[0], column_axes[0]);
+    for (row_index, rows) in row_axes.iter().copied().enumerate() {
+        for (column_index, columns) in column_axes.iter().copied().enumerate() {
+            if row_index == 0 && column_index == 0 {
+                continue;
+            }
+            let candidate =
+                assign_items_to_axes(table, source_items, row_count, column_count, rows, columns);
+            let score = raw_cell_match_score(&candidate.0, &table.cells, geometry);
+            if score > best_score
+                && candidate.1
+                && raw_grid_is_fully_corroborated(&candidate.0, &table.cells, geometry)
+            {
+                best = candidate;
+                best_score = score;
+                selected_axes = (rows, columns);
+            }
+        }
+    }
+
+    // Heuristic detectors cluster and assign columns from each item's leading
+    // edge, while structured capture defaults to centers so ruled-grid and
+    // centered values retain their established geometry. A fully corroborated
+    // row can prove that a long label crossed an anchor midpoint; resolve only
+    // that row and leave unrelated raw-source gaps untouched.
+    if best.1 && matches!(selected_axes.1, TableAxis::Anchors(_)) {
+        let mut leading = assign_items_to_axes_with_column_anchor(
+            table,
+            source_items,
+            row_count,
+            column_count,
+            selected_axes.0,
+            selected_axes.1,
+            ColumnItemAnchor::Leading,
+        );
+        for row in 0..row_count {
+            if row_has_complete_leading_column_association(
+                table,
+                source_items,
+                row,
+                column_count,
+                selected_axes.0,
+                selected_axes.1,
+            ) && raw_row_is_fully_corroborated(
+                &leading.0[row],
+                table.cells.get(row),
+                column_count,
+                geometry,
+            ) && row_only_moves_from_confirmed_blank_origins(
+                &best.0[row],
+                &leading.0[row],
+                table.cells.get(row),
+                column_count,
+            ) && raw_row_match_score(
+                &leading.0[row],
+                table.cells.get(row),
+                column_count,
+                geometry,
+            ) > raw_row_match_score(
+                &best.0[row],
+                table.cells.get(row),
+                column_count,
+                geometry,
+            ) {
+                best.0[row] = std::mem::take(&mut leading.0[row]);
+            }
+        }
+    }
+    (best.0, best.1)
+}
+
+fn assign_items_to_axes(
+    table: &Table,
+    source_items: &[TextItem],
+    row_count: usize,
+    column_count: usize,
+    rows: TableAxis<'_>,
+    columns: TableAxis<'_>,
+) -> (Vec<Vec<Vec<TextItem>>>, bool) {
+    assign_items_to_axes_with_column_anchor(
+        table,
+        source_items,
+        row_count,
+        column_count,
+        rows,
+        columns,
+        ColumnItemAnchor::Center,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnItemAnchor {
+    Center,
+    Leading,
+}
+
+fn assign_items_to_axes_with_column_anchor(
+    table: &Table,
+    source_items: &[TextItem],
+    row_count: usize,
+    column_count: usize,
+    rows: TableAxis<'_>,
+    columns: TableAxis<'_>,
+    column_anchor: ColumnItemAnchor,
+) -> (Vec<Vec<Vec<TextItem>>>, bool) {
+    let mut result = vec![vec![Vec::new(); column_count]; row_count];
     let mut reliable = true;
     for &index in &table.item_indices {
         let Some(item) = source_items.get(index) else {
@@ -505,7 +675,11 @@ fn assign_table_items(
             continue;
         };
         let row = axis_index(item.y, rows);
-        let column = axis_index(item.x + item.width / 2.0, columns);
+        let column_x = match column_anchor {
+            ColumnItemAnchor::Center => item.x + item.width / 2.0,
+            ColumnItemAnchor::Leading => item.x,
+        };
+        let column = axis_index(column_x, columns);
         if let (Some(row), Some(column)) = (row, column) {
             if row < row_count && column < column_count {
                 result[row][column].push(item.clone());
@@ -519,6 +693,185 @@ fn assign_table_items(
     (result, reliable)
 }
 
+/// An alternative interpretation of ambiguous N-coordinate geometry must
+/// reconstruct every established raw slot and leave blank/ragged slots empty.
+/// A count alone is unsafe when duplicate values let one shifted row appear to
+/// match while a different source line lands in a known blank cell.
+fn raw_grid_is_fully_corroborated(
+    cell_items: &[Vec<Vec<TextItem>>],
+    raw_cells: &[Vec<String>],
+    geometry: PageGeometry,
+) -> bool {
+    cell_items.iter().enumerate().all(|(row, cells)| {
+        cells.iter().enumerate().all(|(column, items)| {
+            let raw_text = raw_cells
+                .get(row)
+                .and_then(|raw_row| raw_row.get(column))
+                .map(String::as_str)
+                .unwrap_or("");
+            if raw_text.trim().is_empty() {
+                items.is_empty()
+            } else {
+                lines_matching_raw_cell(&source_lines(items, geometry), raw_text)
+            }
+        })
+    })
+}
+
+/// A row-local leading-edge interpretation is safe only when every claimed
+/// source item for that row still maps to a known column. Items whose row is
+/// unknown make the entire alternative unsafe rather than being guessed into
+/// a nearby cell.
+fn row_has_complete_leading_column_association(
+    table: &Table,
+    source_items: &[TextItem],
+    row: usize,
+    column_count: usize,
+    rows: TableAxis<'_>,
+    columns: TableAxis<'_>,
+) -> bool {
+    table.item_indices.iter().all(|&index| {
+        let Some(item) = source_items.get(index) else {
+            return false;
+        };
+        match axis_index(item.y, rows) {
+            Some(item_row) if item_row == row => {
+                axis_index(item.x, columns).is_some_and(|column| column < column_count)
+            }
+            Some(_) => true,
+            None => false,
+        }
+    })
+}
+
+/// A row alternative cannot rely on a raw source string that has no cell slot.
+/// Every logical column must be present, matched exactly when nonblank, and
+/// empty when the detector established it as blank.
+fn raw_row_is_fully_corroborated(
+    cell_items: &[Vec<TextItem>],
+    raw_cells: Option<&Vec<String>>,
+    column_count: usize,
+    geometry: PageGeometry,
+) -> bool {
+    let Some(raw_cells) = raw_cells else {
+        return false;
+    };
+    (0..column_count).all(|column| {
+        let Some(raw_text) = raw_cells.get(column) else {
+            return false;
+        };
+        let items = cell_items
+            .get(column)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if raw_text.trim().is_empty() {
+            items.is_empty()
+        } else {
+            lines_matching_raw_cell(&source_lines(items, geometry), raw_text)
+        }
+    })
+}
+
+fn raw_row_match_score(
+    cell_items: &[Vec<TextItem>],
+    raw_cells: Option<&Vec<String>>,
+    column_count: usize,
+    geometry: PageGeometry,
+) -> usize {
+    let Some(raw_cells) = raw_cells else {
+        return 0;
+    };
+    (0..column_count)
+        .filter(|&column| {
+            raw_cells.get(column).is_some_and(|raw_text| {
+                !raw_text.trim().is_empty()
+                    && cell_items.get(column).is_some_and(|items| {
+                        lines_matching_raw_cell(&source_lines(items, geometry), raw_text)
+                    })
+            })
+        })
+        .count()
+}
+
+/// An overflow reassociation may only move literal source evidence out of a
+/// detector-confirmed blank. A nonblank raw slot with existing source items is
+/// already an established association, even if another interpretation would
+/// score higher, so leave it unchanged.
+fn row_only_moves_from_confirmed_blank_origins(
+    centered_items: &[Vec<TextItem>],
+    leading_items: &[Vec<TextItem>],
+    raw_cells: Option<&Vec<String>>,
+    column_count: usize,
+) -> bool {
+    let Some(raw_cells) = raw_cells else {
+        return false;
+    };
+    let mut changed = false;
+    for column in 0..column_count {
+        let Some(raw_text) = raw_cells.get(column) else {
+            return false;
+        };
+        let centered = centered_items
+            .get(column)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let leading = leading_items
+            .get(column)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if same_source_items(centered, leading) {
+            continue;
+        }
+        changed = true;
+        if raw_text.trim().is_empty() {
+            if !leading.is_empty() {
+                return false;
+            }
+        } else if !centered.is_empty() {
+            return false;
+        }
+    }
+    changed
+}
+
+fn same_source_items(left: &[TextItem], right: &[TextItem]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.text == right.text
+                && left.x.to_bits() == right.x.to_bits()
+                && left.y.to_bits() == right.y.to_bits()
+                && left.width.to_bits() == right.width.to_bits()
+                && left.height.to_bits() == right.height.to_bits()
+                && left.page == right.page
+                && left.mcid == right.mcid
+        })
+}
+
+fn raw_cell_match_score(
+    cell_items: &[Vec<Vec<TextItem>>],
+    raw_cells: &[Vec<String>],
+    geometry: PageGeometry,
+) -> usize {
+    let mut score = 0;
+    for (row, raw_row) in raw_cells.iter().enumerate() {
+        for (column, raw_text) in raw_row.iter().enumerate() {
+            if raw_text.trim().is_empty() {
+                continue;
+            }
+            let matches = cell_items
+                .get(row)
+                .and_then(|cells| cells.get(column))
+                .is_some_and(|items| {
+                    lines_matching_raw_cell(&source_lines(items, geometry), raw_text)
+                });
+            if matches {
+                score += 1;
+            }
+        }
+    }
+    score
+}
+
 /// A detector's coordinates are either one position per raw logical slot or
 /// one more edge than slots. The raw `cells` matrix remains authoritative for
 /// public dimensions; this only interprets known detector geometry for source
@@ -527,6 +880,10 @@ fn assign_table_items(
 enum TableAxis<'a> {
     Anchors(&'a [f32]),
     Edges(&'a [f32]),
+    LeadingEdges {
+        positions: &'a [f32],
+        trailing_edge: f32,
+    },
 }
 
 fn table_axis(values: &[f32], logical_count: usize) -> Option<TableAxis<'_>> {
@@ -547,7 +904,35 @@ fn table_axis(values: &[f32], logical_count: usize) -> Option<TableAxis<'_>> {
     None
 }
 
+fn table_axis_candidates(
+    values: &[f32],
+    logical_count: usize,
+    supports_leading_edges: bool,
+) -> Option<Vec<TableAxis<'_>>> {
+    let default_axis = table_axis(values, logical_count)?;
+    let mut axes = vec![default_axis];
+    if supports_leading_edges && matches!(default_axis, TableAxis::Anchors(_)) {
+        if let Some(trailing_edge) = inferred_trailing_edge(values) {
+            axes.push(TableAxis::LeadingEdges {
+                positions: values,
+                trailing_edge,
+            });
+        }
+    }
+    Some(axes)
+}
+
+fn inferred_trailing_edge(values: &[f32]) -> Option<f32> {
+    let last = *values.last()?;
+    let previous = *values.get(values.len().checked_sub(2)?)?;
+    let trailing_edge = last + (last - previous);
+    (trailing_edge.is_finite() && trailing_edge != last).then_some(trailing_edge)
+}
+
 fn axis_index(value: f32, axis: TableAxis<'_>) -> Option<usize> {
+    if !value.is_finite() {
+        return None;
+    }
     match axis {
         TableAxis::Anchors(values) => nearest_index(value, values),
         TableAxis::Edges(values) => values.windows(2).position(|pair| {
@@ -555,6 +940,18 @@ fn axis_index(value: f32, axis: TableAxis<'_>) -> Option<usize> {
             let high = pair[0].max(pair[1]);
             value >= low - 2.0 && value <= high + 2.0
         }),
+        TableAxis::LeadingEdges {
+            positions,
+            trailing_edge,
+        } => positions
+            .iter()
+            .enumerate()
+            .find_map(|(index, &leading_edge)| {
+                let following_edge = positions.get(index + 1).copied().unwrap_or(trailing_edge);
+                let low = leading_edge.min(following_edge);
+                let high = leading_edge.max(following_edge);
+                (value >= low - 2.0 && value <= high + 2.0).then_some(index)
+            }),
     }
 }
 
@@ -1039,6 +1436,7 @@ mod tests {
             row_count,
             column_count,
             cells,
+            ..
         } = table_block(&table, &items, geometry(0), None).content
         else {
             panic!("expected a table block");
@@ -1143,6 +1541,7 @@ mod tests {
             row_count,
             column_count,
             cells,
+            ..
         } = table_block(&table, &[], geometry(0), None).content
         else {
             panic!("expected a table block");
@@ -1178,6 +1577,7 @@ mod tests {
             row_count,
             column_count,
             cells,
+            ..
         } = table_block(&table, &items, test_page_geometry(), None).content
         else {
             panic!("expected a table block");

@@ -73,7 +73,7 @@ pub use process_mode::ProcessMode;
 pub use structured::{
     StructuredBlock, StructuredBlockContent, StructuredBounds, StructuredCellRole,
     StructuredCellState, StructuredDocument, StructuredPage, StructuredPageSize,
-    StructuredPageStatus, StructuredTableCell, StructuredTextLine,
+    StructuredPageStatus, StructuredTableCell, StructuredTableContinuation, StructuredTextLine,
 };
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 

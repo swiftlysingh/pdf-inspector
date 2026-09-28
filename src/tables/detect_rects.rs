@@ -1673,13 +1673,7 @@ fn try_build_grid(
             first_col,
             last_col
         );
-        spans.retain(|span| {
-            let last_span_col = span.column + span.column_span - 1;
-            span.column >= first_col && last_span_col <= last_col
-        });
-        for span in &mut spans {
-            span.column -= first_col;
-        }
+        trim_spans_to_columns(&mut spans, first_col, last_col);
         (trimmed_cols, trimmed_cells)
     } else {
         (columns, cells)
@@ -1799,6 +1793,29 @@ pub(crate) fn assign_items_to_grid(
     }
 
     (cells, indices)
+}
+
+/// Intersect rectangle-backed spans with the retained outer-column range.
+/// A span wholly inside a removed column has no remaining logical anchor and
+/// must disappear rather than being clamped onto the new first column.
+fn trim_spans_to_columns(spans: &mut Vec<TableSpan>, first_column: usize, last_column: usize) {
+    let Some(retained_end) = last_column.checked_add(1) else {
+        spans.clear();
+        return;
+    };
+    spans.retain_mut(|span| {
+        let Some(span_end) = span.column.checked_add(span.column_span) else {
+            return false;
+        };
+        let start = span.column.max(first_column);
+        let end = span_end.min(retained_end);
+        if start >= end {
+            return false;
+        }
+        span.column = start - first_column;
+        span.column_span = end - start;
+        true
+    });
 }
 
 fn remove_inner_delimiter_spaces(text: &str) -> String {

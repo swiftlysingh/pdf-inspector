@@ -842,6 +842,307 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     is_parallel
 }
 
+/// A text-only detector can stop at the final row that has values in its other
+/// columns, leaving final wrapped text lines unclaimed. Preserve each recovered
+/// baseline as a sparse row rather than attaching it to an existing cell: the
+/// detector has source anchors for those lines, but no evidence that they share
+/// the terminal cell's physical row.
+///
+/// Call this only for a structurally plain heuristic candidate. Tagged tables,
+/// rectangle grids, and ruled grids establish their own terminal boundary.
+/// Their nearby text remains separate when that boundary is present.
+fn table_with_terminal_cell_continuations(
+    table: &crate::tables::Table,
+    source_items: &[TextItem],
+) -> crate::tables::Table {
+    let mut table = table.clone();
+    if table.kind != crate::tables::TableKind::Data {
+        return table;
+    }
+    absorb_terminal_cell_continuations(&mut table, source_items);
+    table
+}
+
+fn absorb_terminal_cell_continuations(table: &mut crate::tables::Table, source_items: &[TextItem]) {
+    const BASELINE_TOLERANCE: f32 = 2.5;
+
+    let Some(terminal_row) = table
+        .cells
+        .iter()
+        .rposition(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+    else {
+        return;
+    };
+    let column_count = table.cells.iter().map(Vec::len).max().unwrap_or(0);
+    // Recovered terminal baselines need their own row anchors. This is only
+    // safe for the text-alignment detector's one-anchor-per-row geometry;
+    // edge-backed grids have an explicit terminal boundary instead.
+    if column_count == 0
+        || table.columns.len() != column_count
+        || table.rows.len() != table.cells.len()
+        || !table.rows.windows(2).all(|pair| pair[0] > pair[1])
+    {
+        return;
+    }
+
+    let claimed: HashSet<usize> = table.item_indices.iter().copied().collect();
+    let claimed_items: Vec<&TextItem> = claimed
+        .iter()
+        .filter_map(|&index| source_items.get(index))
+        .filter(|item| item.y.is_finite() && item.x.is_finite() && item.width.is_finite())
+        .collect();
+    let Some(terminal_y) = claimed_items
+        .iter()
+        .map(|item| item.y)
+        .min_by(|left, right| left.total_cmp(right))
+    else {
+        return;
+    };
+    let Some(page) = claimed_items.first().map(|item| item.page) else {
+        return;
+    };
+
+    let mut terminal_references: Vec<Vec<&TextItem>> = vec![Vec::new(); column_count];
+    for item in claimed_items
+        .iter()
+        .copied()
+        .filter(|item| (item.y - terminal_y).abs() <= BASELINE_TOLERANCE)
+    {
+        if let Some(column) = terminal_table_column(table, column_count, item.x + item.width / 2.0)
+        {
+            terminal_references[column].push(item);
+        }
+    }
+    if terminal_references.iter().all(Vec::is_empty) {
+        return;
+    }
+
+    let continuation_gaps: Vec<Option<f32>> = terminal_references
+        .iter()
+        .enumerate()
+        .map(|(column, references)| {
+            terminal_wrap_gap(table, terminal_row, column, &claimed_items, references)
+        })
+        .collect();
+
+    let mut lower_items: Vec<(usize, &TextItem)> = source_items
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| {
+            !claimed.contains(index)
+                && item.page == page
+                && !item.text.trim().is_empty()
+                && item.y.is_finite()
+                && item.x.is_finite()
+                && item.width.is_finite()
+                && item.y < terminal_y - BASELINE_TOLERANCE
+        })
+        .collect();
+    lower_items.sort_by(|left, right| {
+        right
+            .1
+            .y
+            .total_cmp(&left.1.y)
+            .then_with(|| left.1.x.total_cmp(&right.1.x))
+    });
+
+    let mut lines: Vec<Vec<(usize, &TextItem)>> = Vec::new();
+    for item in lower_items {
+        if lines.last().is_some_and(|line| {
+            line.first()
+                .is_some_and(|first| (first.1.y - item.1.y).abs() <= BASELINE_TOLERANCE)
+        }) {
+            lines.last_mut().expect("checked above").push(item);
+        } else {
+            lines.push(vec![item]);
+        }
+    }
+
+    let mut continuation_column = None;
+    let mut previous_y = terminal_y;
+    let mut accepted = Vec::new();
+    for line in lines {
+        let line_y = line.first().map(|(_, item)| item.y).unwrap_or(previous_y);
+        let gap = previous_y - line_y;
+        if gap <= 0.0 {
+            break;
+        }
+        let Some(column) = terminal_continuation_column(
+            table,
+            terminal_row,
+            column_count,
+            &terminal_references,
+            &line,
+        ) else {
+            break;
+        };
+        if continuation_column.is_some_and(|existing| existing != column) {
+            break;
+        }
+        let Some(expected_gap) = continuation_gaps.get(column).copied().flatten() else {
+            break;
+        };
+        if !terminal_continuation_gap_matches(gap, expected_gap) {
+            break;
+        }
+        continuation_column = Some(column);
+        previous_y = line_y;
+        accepted.push((line_y, column, line));
+    }
+
+    if continuation_column.is_none() || accepted.is_empty() {
+        return;
+    }
+    for (line_y, column, line) in accepted {
+        let mut line_items: Vec<TextItem> = line.iter().map(|(_, item)| (*item).clone()).collect();
+        let line_rtl = crate::text_utils::is_rtl_text(line_items.iter().map(|item| &item.text));
+        crate::text_utils::sort_line_items(&mut line_items, line_rtl);
+        let text = TextLine {
+            y: line_y,
+            page,
+            items: line_items,
+            adaptive_threshold: 0.10,
+        }
+        .text();
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        let mut row = vec![String::new(); column_count];
+        row[column] = text;
+        table.rows.push(line_y);
+        table.cells.push(row);
+        for (index, _) in line {
+            if !table.item_indices.contains(&index) {
+                table.item_indices.push(index);
+            }
+        }
+    }
+}
+
+/// Require an existing same-column wrap pattern before extending a terminal
+/// cell. A single aligned line below an ordinary table is just as likely to be
+/// prose, a section heading, or a footer as it is a missing wrap.
+fn terminal_wrap_gap(
+    table: &crate::tables::Table,
+    terminal_row: usize,
+    column: usize,
+    claimed_items: &[&TextItem],
+    terminal_references: &[&TextItem],
+) -> Option<f32> {
+    let has_prior_continuation_row = table.cells[..terminal_row].iter().any(|row| {
+        row.get(column).is_some_and(|cell| !cell.trim().is_empty())
+            && row
+                .iter()
+                .enumerate()
+                .all(|(index, cell)| index == column || cell.trim().is_empty())
+    });
+    if !has_prior_continuation_row || terminal_references.is_empty() {
+        return None;
+    }
+
+    let column_count = table.cells.iter().map(Vec::len).max().unwrap_or(0);
+    let mut baselines: Vec<f32> = claimed_items
+        .iter()
+        .copied()
+        .filter(|item| {
+            terminal_table_column(table, column_count, item.x + item.width / 2.0) == Some(column)
+                && terminal_references.iter().any(|reference| {
+                    let font_tolerance = (reference.font_size.abs() * 0.15).max(1.0);
+                    (reference.font_size - item.font_size).abs() <= font_tolerance
+                        && reference.is_bold == item.is_bold
+                        && reference.is_italic == item.is_italic
+                })
+        })
+        .map(|item| item.y)
+        .collect();
+    baselines.sort_by(|left, right| right.total_cmp(left));
+    baselines.dedup_by(|left, right| (*left - *right).abs() <= 2.5);
+    baselines
+        .windows(2)
+        .map(|pair| pair[0] - pair[1])
+        .filter(|gap| gap.is_finite() && *gap >= 4.0)
+        .min_by(|left, right| left.total_cmp(right))
+}
+
+fn terminal_continuation_gap_matches(gap: f32, expected_gap: f32) -> bool {
+    let lower = (expected_gap * 0.60).max(4.0);
+    let upper = expected_gap * 1.45 + 1.0;
+    gap >= lower && gap <= upper
+}
+
+fn terminal_table_column(
+    table: &crate::tables::Table,
+    column_count: usize,
+    x: f32,
+) -> Option<usize> {
+    if !x.is_finite() {
+        return None;
+    }
+    if table.columns.len() == column_count + 1 {
+        return table.columns.windows(2).position(|edges| {
+            let low = edges[0].min(edges[1]);
+            let high = edges[0].max(edges[1]);
+            x >= low - 2.0 && x <= high + 2.0
+        });
+    }
+    (table.columns.len() == column_count).then(|| {
+        table
+            .columns
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| (x - **left).abs().total_cmp(&(x - **right).abs()))
+            .map(|(column, _)| column)
+    })?
+}
+
+fn terminal_continuation_column(
+    table: &crate::tables::Table,
+    terminal_row: usize,
+    column_count: usize,
+    references: &[Vec<&TextItem>],
+    line: &[(usize, &TextItem)],
+) -> Option<usize> {
+    let starts_mid_sentence = line
+        .iter()
+        .flat_map(|(_, item)| item.text.chars())
+        .find(|character| character.is_alphabetic())
+        .is_some_and(|character| character.is_lowercase());
+    if !starts_mid_sentence {
+        return None;
+    }
+
+    let mut line_column = None;
+    for (_, item) in line {
+        let column = terminal_table_column(table, column_count, item.x + item.width / 2.0)?;
+        if table
+            .cells
+            .get(terminal_row)
+            .and_then(|row| row.get(column))
+            .is_none_or(|cell| cell.trim().is_empty())
+        {
+            return None;
+        }
+        if line_column.is_some_and(|existing| existing != column) {
+            return None;
+        }
+        line_column = Some(column);
+    }
+    let column = line_column?;
+    let source_start = line.iter().map(|(_, item)| item.x).reduce(f32::min)?;
+    references[column]
+        .iter()
+        .any(|reference| {
+            let alignment_tolerance = (reference.font_size.abs() * 0.9).clamp(5.0, 10.0);
+            let font_tolerance = (reference.font_size.abs() * 0.15).max(1.0);
+            (reference.x - source_start).abs() <= alignment_tolerance
+                && (reference.font_size - line[0].1.font_size).abs() <= font_tolerance
+                && reference.is_bold == line[0].1.is_bold
+                && reference.is_italic == line[0].1.is_italic
+        })
+        .then_some(column)
+}
+
 #[derive(Clone, Copy)]
 enum TableOutputMode {
     Markdown {
@@ -1699,6 +2000,16 @@ fn convert_items_with_rects_lines_and_table_output(
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
         let page_content_width = content_width(&page_items);
+        // Keep raw tagged-table evidence even when structure-tree detection
+        // later rejects a one-row or partial descriptor. It closes terminal
+        // recovery only for a heuristic candidate that claims tagged items.
+        let raw_struct_mcids: HashSet<i64> = struct_tables
+            .iter()
+            .flat_map(|table| &table.rows)
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| &cell.mcids)
+            .filter_map(|&(mcid, tagged_page)| (tagged_page == page).then_some(mcid))
+            .collect();
 
         // Chart-bar regions: bar charts drawn as filled rects read as cell
         // rects or aligned text and get gridded into phantom tables. Their
@@ -1862,8 +2173,14 @@ fn convert_items_with_rects_lines_and_table_output(
             //    Only use struct-tree tables when they capture a majority (≥50%) of
             //    band items.  Incomplete struct trees (partial tagging) should fall
             //    through to geometry detection which sees all items.
-            if !struct_tables.is_empty() {
-                let st_tables = detect_tables_from_struct_tree(band_items, struct_tables, page);
+            let st_tables = if struct_tables.is_empty() {
+                Vec::new()
+            } else {
+                detect_tables_from_struct_tree(band_items, struct_tables, page)
+            };
+            let heuristic_has_soft_boundary =
+                st_tables.is_empty() && band_rects.is_empty() && band_lines.is_empty();
+            if !st_tables.is_empty() {
                 for table in &st_tables {
                     let coverage = table.item_indices.len() as f32 / band_items.len().max(1) as f32;
                     if coverage < 0.5 {
@@ -1990,7 +2307,10 @@ fn convert_items_with_rects_lines_and_table_output(
 
             // 3b. Heuristic fallback on unclaimed items
             let mut run_heuristic =
-                |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
+                |subset_items: &[TextItem],
+                 index_map: &[usize],
+                 min_items: usize,
+                 recover_terminal_rows: bool| {
                     if subset_items.len() < min_items {
                         return;
                     }
@@ -2011,6 +2331,18 @@ fn convert_items_with_rects_lines_and_table_output(
                         page_content_width,
                     );
                     for table in tables {
+                        let candidate_has_raw_struct_evidence =
+                            table.item_indices.iter().any(|&index| {
+                                subset_items
+                                    .get(index)
+                                    .and_then(|item| item.mcid)
+                                    .is_some_and(|mcid| raw_struct_mcids.contains(&mcid))
+                            });
+                        let table = if recover_terminal_rows && !candidate_has_raw_struct_evidence {
+                            table_with_terminal_cell_continuations(&table, subset_items)
+                        } else {
+                            table
+                        };
                         if reject_parallel_prose && is_parallel_prose_table(&table) {
                             log::debug!(
                                 "page {}: rejected {}x{} parallel-prose table hypothesis",
@@ -2053,7 +2385,7 @@ fn convert_items_with_rects_lines_and_table_output(
             if rect_claimed.is_empty() && hint_regions.is_empty() {
                 // No rect tables or hints — run heuristic on all band items
                 let identity_map: Vec<usize> = (0..band_items.len()).collect();
-                run_heuristic(band_items, &identity_map, 6);
+                run_heuristic(band_items, &identity_map, 6, heuristic_has_soft_boundary);
             } else if rect_claimed.is_empty() && !hint_regions.is_empty() {
                 // No rect tables but hint regions exist — run heuristic separately
                 // on items inside each hint region and on items outside all hints.
@@ -2067,7 +2399,7 @@ fn convert_items_with_rects_lines_and_table_output(
                         })
                         .map(|(idx, item)| (item.clone(), idx))
                         .unzip();
-                    run_heuristic(&inside_items, &inside_map, 6);
+                    run_heuristic(&inside_items, &inside_map, 6, false);
                     for &band_idx in &inside_map {
                         rect_claimed.insert(band_idx);
                     }
@@ -2078,7 +2410,7 @@ fn convert_items_with_rects_lines_and_table_output(
                     .filter(|(idx, _)| !rect_claimed.contains(idx))
                     .map(|(idx, item)| (item.clone(), idx))
                     .unzip();
-                run_heuristic(&outside_items, &outside_map, 6);
+                run_heuristic(&outside_items, &outside_map, 6, false);
             } else {
                 // Rect tables found — run heuristic on unclaimed items
                 let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = band_items
@@ -2087,7 +2419,7 @@ fn convert_items_with_rects_lines_and_table_output(
                     .filter(|(idx, _)| !rect_claimed.contains(idx))
                     .map(|(idx, item)| (item.clone(), idx))
                     .unzip();
-                run_heuristic(&unclaimed_items, &unclaimed_map, 6);
+                run_heuristic(&unclaimed_items, &unclaimed_map, 6, false);
             }
 
             // 4. Column-based table detection for borderless tabular layouts.

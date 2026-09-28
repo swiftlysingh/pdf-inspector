@@ -34,7 +34,7 @@ mod detect_lines;
 pub(crate) mod detect_rects;
 mod detect_struct;
 mod financial;
-mod format;
+pub(crate) mod format;
 mod grid;
 pub mod structured;
 

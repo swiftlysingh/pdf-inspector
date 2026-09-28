@@ -83,15 +83,32 @@ impl PositionedMarkdown {
         source_items: &[TextItem],
         capture_structured_output: bool,
     ) -> Self {
+        let captured_table = capture_structured_output.then(|| {
+            // Keep only the detector-claimed source items and rebase their
+            // indexes. A structured fallback must never turn the entire
+            // detector band into duplicate text when one claimed item cannot
+            // be placed in the raw grid.
+            let mut captured_item_indices = Vec::with_capacity(table.item_indices.len());
+            let mut captured_source_items = Vec::with_capacity(table.item_indices.len());
+            for &index in &table.item_indices {
+                if let Some(item) = source_items.get(index) {
+                    captured_item_indices.push(captured_source_items.len());
+                    captured_source_items.push(item.clone());
+                }
+            }
+            let mut captured_table = table.clone();
+            captured_table.item_indices = captured_item_indices;
+            CapturedTable {
+                table: captured_table,
+                source_items: captured_source_items,
+            }
+        });
         Self {
             y,
             x,
             markdown,
             chart_order,
-            captured_table: capture_structured_output.then(|| CapturedTable {
-                table: table.clone(),
-                source_items: source_items.to_vec(),
-            }),
+            captured_table,
         }
     }
 }
