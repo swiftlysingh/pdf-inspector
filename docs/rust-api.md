@@ -528,6 +528,63 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `ProcessMode::Analyze` | Detect + extract + layout analysis (no Markdown) | `markdown` is `None`, `layout` is populated |
 | `ProcessMode::DetectOnly` | Classification only (fastest) | `markdown` is `None`, `layout` is default |
 
+### Structured output in Analyze mode
+
+Enable structured capture to get page-local text and tables without rendering
+Markdown:
+
+```rust
+use pdf_inspector::{process_pdf_mem_with_options, PdfOptions, ProcessMode};
+
+let bytes = std::fs::read("document.pdf")?;
+let result = process_pdf_mem_with_options(
+    &bytes,
+    PdfOptions::new()
+        .mode(ProcessMode::Analyze)
+        .capture_structured_output(),
+)?;
+
+assert!(result.markdown.is_none());
+let document = result.structured_document.expect("capture was enabled");
+println!("Captured {} pages", document.pages.len());
+```
+
+Capture reuses the loaded PDF, extraction, table detection, and reading-order
+pipeline. It adds structure assembly work to Analyze mode but skips Markdown
+rendering. Scanned and image-only documents can return pages with empty blocks.
+
+This option also enables text-quality checks that plain Analyze mode skips:
+
+- Predominantly garbage text in a `Mixed` document changes `pdf_type` to
+  `Scanned`, sets `confidence` to `0.95`, and marks every processed page for OCR.
+- Predominantly garbage text in a `TextBased` document sets
+  `has_encoding_issues` and marks every processed page for OCR.
+- A `TextBased` document with no pages already marked for OCR is considered
+  sparse when extracted text has fewer than 50 UTF-8 bytes per processed page
+  and fewer than 500 bytes total. Every processed page is then marked for OCR.
+
+These checks use extracted non-image item text concatenated without added
+separators. Full mode uses rendered Markdown, so its text lengths and quality
+decisions can differ. Structured capture is therefore not a promise to preserve
+plain Analyze mode's `pdf_type`, `confidence`, `has_encoding_issues`, or
+`pages_needing_ocr`. Leave capture disabled when those existing Analyze-mode
+decisions are required.
+
+With a page filter, these additional checks apply to the selected pages;
+`page_count` remains the source document's total. Structured `page_index` values
+are zero-based, while page filters and `pages_needing_ocr` use one-based page
+numbers. A structured page's `NeedsOcr` status follows `pages_needing_ocr` and
+may accompany useful partial text. This call reports OCR needs; it does not run
+OCR.
+
+Structured capture also requires usable geometry for every selected page.
+A missing usable page box, unsupported rotation, non-positive or non-finite
+numeric `/UserUnit`, or invalid resulting page size returns
+`PdfError::InvalidStructure`, even for a scanned page. Missing or unresolvable
+`/UserUnit` values default to `1`. Structured capture does not use ordinary
+extraction's Letter-size fallback when no usable page box exists. Extraction errors also
+propagate instead of using the legacy Mixed-document fallback to empty output.
+
 ## Functions
 
 | Function | Description |
