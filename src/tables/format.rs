@@ -18,7 +18,9 @@ pub fn table_to_markdown(table: &Table) -> String {
     }
 
     // Clean up the table: merge continuation rows, extract footnotes, remove empty rows
-    let (cleaned_cells, footnotes) = clean_table_cells(&table.cells);
+    let layout = table_layout(&table.cells);
+    let cleaned_cells = layout.rows;
+    let footnotes = layout.footnotes;
 
     if cleaned_cells.is_empty() {
         return String::new();
@@ -70,7 +72,7 @@ pub(crate) fn is_complete_data_table(table: &Table) -> bool {
         return false;
     }
 
-    let (cleaned_cells, _) = clean_table_cells(&table.cells);
+    let cleaned_cells = table_layout(&table.cells).rows;
     cleaned_cells.len() >= 2 && cleaned_cells.first().is_some_and(|row| row.len() >= 2)
 }
 
@@ -292,11 +294,23 @@ fn ends_like_incomplete_phrase(cell: &str) -> bool {
 }
 
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
-fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
-    let mut cleaned: Vec<Vec<String>> = Vec::new();
-    let mut footnotes: Vec<String> = Vec::new();
+/// Layout cleanup shared by Markdown and source-preserving output.
+///
+/// Structured output consumes only `continuation_rows`. Empty-row removal and
+/// footnote extraction remain Markdown presentation choices.
+pub(crate) struct TableLayout {
+    pub(crate) rows: Vec<Vec<String>>,
+    pub(crate) footnotes: Vec<String>,
+    pub(crate) continuation_rows: Vec<(usize, usize)>,
+}
 
-    for row in cells {
+pub(crate) fn table_layout(cells: &[Vec<String>]) -> TableLayout {
+    let mut cleaned: Vec<Vec<String>> = Vec::new();
+    let mut cleaned_source_rows: Vec<usize> = Vec::new();
+    let mut footnotes: Vec<String> = Vec::new();
+    let mut continuation_rows = Vec::new();
+
+    for (source_row, row) in cells.iter().enumerate() {
         // Check if this row is empty
         if row.iter().all(|c| c.trim().is_empty()) {
             continue;
@@ -466,6 +480,9 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         if is_continuation {
             // Merge with previous row
             if let Some(prev_row) = cleaned.last_mut() {
+                if let Some(&anchor_row) = cleaned_source_rows.last() {
+                    continuation_rows.push((source_row, anchor_row));
+                }
                 for (col_idx, cell) in row.iter().enumerate() {
                     let cell_text = cell.trim();
                     if !cell_text.is_empty() && col_idx < prev_row.len() {
@@ -479,10 +496,21 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         } else {
             // Regular row - add as new row
             cleaned.push(row.iter().map(|c| c.trim().to_string()).collect());
+            cleaned_source_rows.push(source_row);
         }
     }
 
-    (cleaned, footnotes)
+    TableLayout {
+        rows: cleaned,
+        footnotes,
+        continuation_rows,
+    }
+}
+
+#[cfg(test)]
+fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
+    let layout = table_layout(cells);
+    (layout.rows, layout.footnotes)
 }
 
 /// Check if a cell value indicates a footnote row
@@ -924,6 +952,7 @@ mod tests {
                 vec!["Bob".into(), "25".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -940,6 +969,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["Only".into(), "Row".into()]],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -957,6 +987,7 @@ mod tests {
                 vec!["Accuracy".into(), "95%".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         assert!(is_complete_data_table(&complete));
@@ -977,6 +1008,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         assert_eq!(table_to_markdown(&table), "");
@@ -993,6 +1025,7 @@ mod tests {
                 vec!["(1)".into(), "Footnote text".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -1009,6 +1042,7 @@ mod tests {
                 vec!["太郎".into(), "25".into()],
             ],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
@@ -1023,6 +1057,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec![]],
             item_indices: vec![],
+            spans: vec![],
             kind: TableKind::Data,
         };
         assert_eq!(table_to_markdown(&table), "");

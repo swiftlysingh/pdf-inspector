@@ -272,7 +272,10 @@ fn cmap_entry(
     obj_num: u32,
     promote: bool,
 ) -> CMapEntry {
-    if primary_entries < 10 {
+    // A sparse single-byte CMap falls back per unmapped byte during text
+    // decoding. Keeping it primary preserves its explicit mappings while the
+    // fallback fills only the missing bytes.
+    if primary_entries < 10 && primary.code_byte_length != 1 {
         if let Some(fb) = fallback.take() {
             debug!(
                 "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
@@ -4848,6 +4851,29 @@ endbfchar
         assert_eq!(base.gap_fill(37), None);
         let merged = merge_cmaps(base, cmap_of_ranges(&[(38, 38, 0x43)]));
         assert_eq!(merged.gap_fill(37), Some('B'));
+    }
+
+    #[test]
+    fn sparse_single_byte_cmap_keeps_explicit_mapping_and_fallback() {
+        let mut primary = ToUnicodeCMap::new();
+        primary.code_byte_length = 1;
+        primary.char_map.insert(0x74, "◆".to_string());
+
+        let mut fallback = ToUnicodeCMap::new();
+        fallback.code_byte_length = 1;
+        fallback.char_map.insert(0x22, "A".to_string());
+
+        let entry = cmap_entry(primary, None, Some(fallback), 1, 1, false);
+
+        assert_eq!(entry.primary.lookup(0x74).as_deref(), Some("◆"));
+        assert_eq!(
+            entry
+                .fallback
+                .as_ref()
+                .and_then(|cmap| cmap.lookup(0x22))
+                .as_deref(),
+            Some("A")
+        );
     }
 
     #[test]

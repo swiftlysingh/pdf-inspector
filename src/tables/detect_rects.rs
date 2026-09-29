@@ -6,7 +6,7 @@ use log::debug;
 
 use crate::types::{PdfRect, TextItem};
 
-use super::Table;
+use super::{Table, TableSpan};
 
 const DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS: usize = 8;
 const COMPETING_TABLE_MIN_ROWS: usize = 8;
@@ -1560,9 +1560,11 @@ fn try_build_grid(
     // Skip for wide tables (>10 columns) where spanning rects are typically
     // background fills rather than true merged cells (e.g. statistical lookup
     // tables with row-grouping shading).
-    if num_cols <= 10 {
-        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects, skip_rects);
-    }
+    let mut spans = if num_cols <= 10 {
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects, skip_rects)
+    } else {
+        Vec::new()
+    };
 
     // Compute column centers and row centers for the Table struct
     let columns: Vec<f32> = (0..num_cols)
@@ -1671,12 +1673,13 @@ fn try_build_grid(
             first_col,
             last_col
         );
+        trim_spans_to_columns(&mut spans, first_col, last_col);
         (trimmed_cols, trimmed_cells)
     } else {
         (columns, cells)
     };
 
-    GridResult::Ok(Table::new(columns, rows, cells, item_indices))
+    GridResult::Ok(Table::new(columns, rows, cells, item_indices).with_spans(spans))
 }
 
 /// Deduplicate nearby edge values within a tolerance, returning sorted unique edges.
@@ -1792,6 +1795,29 @@ pub(crate) fn assign_items_to_grid(
     (cells, indices)
 }
 
+/// Intersect rectangle-backed spans with the retained outer-column range.
+/// A span wholly inside a removed column has no remaining logical anchor and
+/// must disappear rather than being clamped onto the new first column.
+fn trim_spans_to_columns(spans: &mut Vec<TableSpan>, first_column: usize, last_column: usize) {
+    let Some(retained_end) = last_column.checked_add(1) else {
+        spans.clear();
+        return;
+    };
+    spans.retain_mut(|span| {
+        let Some(span_end) = span.column.checked_add(span.column_span) else {
+            return false;
+        };
+        let start = span.column.max(first_column);
+        let end = span_end.min(retained_end);
+        if start >= end {
+            return false;
+        }
+        span.column = start - first_column;
+        span.column_span = end - start;
+        true
+    });
+}
+
 fn remove_inner_delimiter_spaces(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut result = String::with_capacity(text.len());
@@ -1826,11 +1852,12 @@ fn propagate_merged_cells(
     row_edges: &[f32],
     group_rects: &[(f32, f32, f32, f32)],
     skip_rects: &[bool],
-) {
+) -> Vec<TableSpan> {
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
     let tol = 6.0;
 
+    let mut spans = Vec::new();
     for col in 0..num_cols {
         for (rect_idx, rect) in group_rects.iter().enumerate() {
             let (rx, ry, rw, rh) = *rect;
@@ -1855,14 +1882,14 @@ fn propagate_merged_cells(
             // entirely below the row but still passes the tolerance-slack
             // check, cascading body text from unrelated rows into one
             // merged cell.
-            let spans = |r: usize| {
+            let rect_spans_row = |r: usize| {
                 let row_top = row_edges[r];
                 let row_bot = row_edges[r + 1];
                 let overlap = (row_top.min(ry + rh) - row_bot.max(ry)).max(0.0);
                 overlap > tol
             };
-            let first_row = (0..num_rows).find(|&r| spans(r));
-            let last_row = (0..num_rows).rfind(|&r| spans(r));
+            let first_row = (0..num_rows).find(|&r| rect_spans_row(r));
+            let last_row = (0..num_rows).rfind(|&r| rect_spans_row(r));
 
             let (first, last) = match (first_row, last_row) {
                 (Some(f), Some(l)) if l > f => (f, l),
@@ -1886,8 +1913,15 @@ fn propagate_merged_cells(
             for row in cells.iter_mut().take(last + 1).skip(first + 1) {
                 row[col] = String::new();
             }
+            spans.push(TableSpan {
+                row: first,
+                column: col,
+                row_span: last - first + 1,
+                column_span: 1,
+            });
         }
     }
+    spans
 }
 
 /// Check if rects form a row-stripe pattern (full-width horizontal bands).
@@ -4700,9 +4734,26 @@ mod tests {
         // Rect spanning both rows in col 0
         let group_rects = vec![(0.0, 60.0, 50.0, 40.0)];
         let skip = vec![false];
-        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        let spans = propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
         assert_eq!(cells[0][0], "Top Bottom");
         assert!(cells[1][0].is_empty());
+        assert_eq!(
+            spans,
+            vec![TableSpan {
+                row: 0,
+                column: 0,
+                row_span: 2,
+                column_span: 1,
+            }]
+        );
+
+        // This is the same native evidence later consumed by structured
+        // capture: the merged anchor carries an explicit row span rather than
+        // asking downstream code to infer it from the cleared grid slot.
+        let table =
+            Table::new(vec![25.0, 75.0], vec![90.0, 70.0], cells, Vec::new()).with_spans(spans);
+        assert_eq!(table.spans[0].row_span, 2);
+        assert_eq!(table.spans[0].column_span, 1);
     }
 
     #[test]

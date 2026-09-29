@@ -16,15 +16,16 @@ mod preprocess;
 
 pub use convert::to_markdown_from_lines;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::types::{PdfLine, PdfRect, TextItem};
+use crate::structured::{self, PageGeometry, StructuredBlock};
+use crate::types::{PdfLine, PdfRect, TextItem, TextLine};
 
 use analysis::calculate_font_stats_from_items;
 use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
 use convert::{
-    merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
-    PositionedMarkdown,
+    merge_continuation_tables, positioned_block_precedes_line, positioned_tables_for_page,
+    to_markdown_from_lines_with_tables_and_images, ChartProseOrder, PositionedMarkdown,
 };
 
 const CHART_REGION_PAD: f32 = 20.0;
@@ -841,11 +842,325 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     is_parallel
 }
 
+/// A text-only detector can stop at the final row that has values in its other
+/// columns, leaving final wrapped text lines unclaimed. Preserve each recovered
+/// baseline as a sparse row rather than attaching it to an existing cell: the
+/// detector has source anchors for those lines, but no evidence that they share
+/// the terminal cell's physical row.
+///
+/// Call this only for a structurally plain heuristic candidate. Tagged tables,
+/// rectangle grids, and ruled grids establish their own terminal boundary.
+/// Their nearby text remains separate when that boundary is present.
+fn table_with_terminal_cell_continuations(
+    table: &crate::tables::Table,
+    source_items: &[TextItem],
+) -> crate::tables::Table {
+    let mut table = table.clone();
+    if table.kind != crate::tables::TableKind::Data {
+        return table;
+    }
+    absorb_terminal_cell_continuations(&mut table, source_items);
+    table
+}
+
+fn absorb_terminal_cell_continuations(table: &mut crate::tables::Table, source_items: &[TextItem]) {
+    const BASELINE_TOLERANCE: f32 = 2.5;
+
+    let Some(terminal_row) = table
+        .cells
+        .iter()
+        .rposition(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+    else {
+        return;
+    };
+    let column_count = table.cells.iter().map(Vec::len).max().unwrap_or(0);
+    // Recovered terminal baselines need their own row anchors. This is only
+    // safe for the text-alignment detector's one-anchor-per-row geometry;
+    // edge-backed grids have an explicit terminal boundary instead.
+    if column_count == 0
+        || table.columns.len() != column_count
+        || table.rows.len() != table.cells.len()
+        || !table.rows.windows(2).all(|pair| pair[0] > pair[1])
+    {
+        return;
+    }
+
+    let claimed: HashSet<usize> = table.item_indices.iter().copied().collect();
+    let claimed_items: Vec<&TextItem> = claimed
+        .iter()
+        .filter_map(|&index| source_items.get(index))
+        .filter(|item| item.y.is_finite() && item.x.is_finite() && item.width.is_finite())
+        .collect();
+    let Some(terminal_y) = claimed_items
+        .iter()
+        .map(|item| item.y)
+        .min_by(|left, right| left.total_cmp(right))
+    else {
+        return;
+    };
+    let Some(page) = claimed_items.first().map(|item| item.page) else {
+        return;
+    };
+
+    let mut terminal_references: Vec<Vec<&TextItem>> = vec![Vec::new(); column_count];
+    for item in claimed_items
+        .iter()
+        .copied()
+        .filter(|item| (item.y - terminal_y).abs() <= BASELINE_TOLERANCE)
+    {
+        if let Some(column) = terminal_table_column(table, column_count, item.x + item.width / 2.0)
+        {
+            terminal_references[column].push(item);
+        }
+    }
+    if terminal_references.iter().all(Vec::is_empty) {
+        return;
+    }
+
+    let continuation_gaps: Vec<Option<f32>> = terminal_references
+        .iter()
+        .enumerate()
+        .map(|(column, references)| {
+            terminal_wrap_gap(table, terminal_row, column, &claimed_items, references)
+        })
+        .collect();
+
+    let mut lower_items: Vec<(usize, &TextItem)> = source_items
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| {
+            !claimed.contains(index)
+                && item.page == page
+                && !item.text.trim().is_empty()
+                && item.y.is_finite()
+                && item.x.is_finite()
+                && item.width.is_finite()
+                && item.y < terminal_y - BASELINE_TOLERANCE
+        })
+        .collect();
+    lower_items.sort_by(|left, right| {
+        right
+            .1
+            .y
+            .total_cmp(&left.1.y)
+            .then_with(|| left.1.x.total_cmp(&right.1.x))
+    });
+
+    let mut lines: Vec<Vec<(usize, &TextItem)>> = Vec::new();
+    for item in lower_items {
+        if lines.last().is_some_and(|line| {
+            line.first()
+                .is_some_and(|first| (first.1.y - item.1.y).abs() <= BASELINE_TOLERANCE)
+        }) {
+            lines.last_mut().expect("checked above").push(item);
+        } else {
+            lines.push(vec![item]);
+        }
+    }
+
+    let mut continuation_column = None;
+    let mut previous_y = terminal_y;
+    let mut accepted = Vec::new();
+    for line in lines {
+        let line_y = line.first().map(|(_, item)| item.y).unwrap_or(previous_y);
+        let gap = previous_y - line_y;
+        if gap <= 0.0 {
+            break;
+        }
+        let Some(column) = terminal_continuation_column(
+            table,
+            terminal_row,
+            column_count,
+            &terminal_references,
+            &line,
+        ) else {
+            break;
+        };
+        if continuation_column.is_some_and(|existing| existing != column) {
+            break;
+        }
+        let Some(expected_gap) = continuation_gaps.get(column).copied().flatten() else {
+            break;
+        };
+        if !terminal_continuation_gap_matches(gap, expected_gap) {
+            break;
+        }
+        continuation_column = Some(column);
+        previous_y = line_y;
+        accepted.push((line_y, column, line));
+    }
+
+    if continuation_column.is_none() || accepted.is_empty() {
+        return;
+    }
+    for (line_y, column, line) in accepted {
+        let mut line_items: Vec<TextItem> = line.iter().map(|(_, item)| (*item).clone()).collect();
+        let line_rtl = crate::text_utils::is_rtl_text(line_items.iter().map(|item| &item.text));
+        crate::text_utils::sort_line_items(&mut line_items, line_rtl);
+        let text = TextLine {
+            y: line_y,
+            page,
+            items: line_items,
+            adaptive_threshold: 0.10,
+        }
+        .text();
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        let mut row = vec![String::new(); column_count];
+        row[column] = text;
+        table.rows.push(line_y);
+        table.cells.push(row);
+        for (index, _) in line {
+            if !table.item_indices.contains(&index) {
+                table.item_indices.push(index);
+            }
+        }
+    }
+}
+
+/// Require an existing same-column wrap pattern before extending a terminal
+/// cell. A single aligned line below an ordinary table is just as likely to be
+/// prose, a section heading, or a footer as it is a missing wrap.
+fn terminal_wrap_gap(
+    table: &crate::tables::Table,
+    terminal_row: usize,
+    column: usize,
+    claimed_items: &[&TextItem],
+    terminal_references: &[&TextItem],
+) -> Option<f32> {
+    let has_prior_continuation_row = table.cells[..terminal_row].iter().any(|row| {
+        row.get(column).is_some_and(|cell| !cell.trim().is_empty())
+            && row
+                .iter()
+                .enumerate()
+                .all(|(index, cell)| index == column || cell.trim().is_empty())
+    });
+    if !has_prior_continuation_row || terminal_references.is_empty() {
+        return None;
+    }
+
+    let column_count = table.cells.iter().map(Vec::len).max().unwrap_or(0);
+    let mut baselines: Vec<f32> = claimed_items
+        .iter()
+        .copied()
+        .filter(|item| {
+            terminal_table_column(table, column_count, item.x + item.width / 2.0) == Some(column)
+                && terminal_references.iter().any(|reference| {
+                    let font_tolerance = (reference.font_size.abs() * 0.15).max(1.0);
+                    (reference.font_size - item.font_size).abs() <= font_tolerance
+                        && reference.is_bold == item.is_bold
+                        && reference.is_italic == item.is_italic
+                })
+        })
+        .map(|item| item.y)
+        .collect();
+    baselines.sort_by(|left, right| right.total_cmp(left));
+    baselines.dedup_by(|left, right| (*left - *right).abs() <= 2.5);
+    baselines
+        .windows(2)
+        .map(|pair| pair[0] - pair[1])
+        .filter(|gap| gap.is_finite() && *gap >= 4.0)
+        .min_by(|left, right| left.total_cmp(right))
+}
+
+fn terminal_continuation_gap_matches(gap: f32, expected_gap: f32) -> bool {
+    let lower = (expected_gap * 0.60).max(4.0);
+    let upper = expected_gap * 1.45 + 1.0;
+    gap >= lower && gap <= upper
+}
+
+fn terminal_table_column(
+    table: &crate::tables::Table,
+    column_count: usize,
+    x: f32,
+) -> Option<usize> {
+    if !x.is_finite() {
+        return None;
+    }
+    if table.columns.len() == column_count + 1 {
+        return table.columns.windows(2).position(|edges| {
+            let low = edges[0].min(edges[1]);
+            let high = edges[0].max(edges[1]);
+            x >= low - 2.0 && x <= high + 2.0
+        });
+    }
+    (table.columns.len() == column_count).then(|| {
+        table
+            .columns
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| (x - **left).abs().total_cmp(&(x - **right).abs()))
+            .map(|(column, _)| column)
+    })?
+}
+
+fn terminal_continuation_column(
+    table: &crate::tables::Table,
+    terminal_row: usize,
+    column_count: usize,
+    references: &[Vec<&TextItem>],
+    line: &[(usize, &TextItem)],
+) -> Option<usize> {
+    let starts_mid_sentence = line
+        .iter()
+        .flat_map(|(_, item)| item.text.chars())
+        .find(|character| character.is_alphabetic())
+        .is_some_and(|character| character.is_lowercase());
+    if !starts_mid_sentence {
+        return None;
+    }
+
+    let mut line_column = None;
+    for (_, item) in line {
+        let column = terminal_table_column(table, column_count, item.x + item.width / 2.0)?;
+        if table
+            .cells
+            .get(terminal_row)
+            .and_then(|row| row.get(column))
+            .is_none_or(|cell| cell.trim().is_empty())
+        {
+            return None;
+        }
+        if line_column.is_some_and(|existing| existing != column) {
+            return None;
+        }
+        line_column = Some(column);
+    }
+    let column = line_column?;
+    let source_start = line.iter().map(|(_, item)| item.x).reduce(f32::min)?;
+    references[column]
+        .iter()
+        .any(|reference| {
+            let alignment_tolerance = (reference.font_size.abs() * 0.9).clamp(5.0, 10.0);
+            let font_tolerance = (reference.font_size.abs() * 0.15).max(1.0);
+            (reference.x - source_start).abs() <= alignment_tolerance
+                && (reference.font_size - line[0].1.font_size).abs() <= font_tolerance
+                && reference.is_bold == line[0].1.is_bold
+                && reference.is_italic == line[0].1.is_italic
+        })
+        .then_some(column)
+}
+
 #[derive(Clone, Copy)]
 enum TableOutputMode {
-    Markdown,
+    Markdown {
+        render_markdown: bool,
+    },
     #[cfg(feature = "ocr")]
     CompleteTables,
+}
+
+impl TableOutputMode {
+    fn render_markdown(self) -> bool {
+        matches!(
+            self,
+            Self::Markdown {
+                render_markdown: true
+            }
+        )
+    }
 }
 
 struct TableDetectionOutput {
@@ -873,20 +1188,24 @@ impl TableDetectionOutput {
         &mut self,
         page: u32,
         table: &crate::tables::Table,
+        source_items: &[TextItem],
         chart_order: Option<ChartProseOrder>,
+        render_markdown: bool,
+        capture_structured_output: bool,
     ) {
         self.pages_with_detected_tables.insert(page);
         match self.mode {
-            TableOutputMode::Markdown => {
+            TableOutputMode::Markdown { .. } => {
                 self.pages_with_tables.insert(page);
                 self.markdown_by_page
                     .entry(page)
                     .or_default()
-                    .push(PositionedMarkdown::new(
-                        table.rows.first().copied().unwrap_or(0.0),
-                        table.columns.first().copied().unwrap_or(0.0),
-                        crate::tables::table_to_markdown(table),
+                    .push(positioned_table(
+                        table,
+                        source_items,
                         chart_order,
+                        render_markdown,
+                        capture_structured_output,
                     ));
             }
             #[cfg(feature = "ocr")]
@@ -909,10 +1228,34 @@ impl TableDetectionOutput {
 }
 
 #[derive(Default)]
-struct MarkdownConversionOutput {
-    markdown: String,
+pub(crate) struct MarkdownConversionResult {
+    pub(crate) markdown: String,
+    pub(crate) blocks_by_page: Option<BTreeMap<u32, Vec<StructuredBlock>>>,
     #[cfg(feature = "ocr")]
     detected_tables: Vec<(u32, crate::tables::Table)>,
+}
+
+fn positioned_table(
+    table: &crate::tables::Table,
+    source_items: &[TextItem],
+    chart_order: Option<ChartProseOrder>,
+    render_markdown: bool,
+    capture_structured_output: bool,
+) -> PositionedMarkdown {
+    let markdown = if render_markdown {
+        crate::tables::table_to_markdown(table)
+    } else {
+        String::new()
+    };
+    PositionedMarkdown::table(
+        table.rows.first().copied().unwrap_or(0.0),
+        table.columns.first().copied().unwrap_or(0.0),
+        markdown,
+        chart_order,
+        table,
+        source_items,
+        capture_structured_output,
+    )
 }
 
 /// Derive a side-by-side split from rect hint regions.
@@ -1461,13 +1804,8 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
 ) -> String {
-    convert_items_with_rects_lines_and_table_output(
-        items,
-        options,
-        rects,
-        pdf_lines,
-        context,
-        TableOutputMode::Markdown,
+    to_markdown_from_items_with_rects_and_lines_with_structured_capture(
+        items, options, rects, pdf_lines, context, None, true,
     )
     .markdown
 }
@@ -1496,6 +1834,7 @@ pub(crate) fn complete_table_markdown_from_items(
             precomputed_chart_regions: None,
         },
         TableOutputMode::CompleteTables,
+        None,
     );
     let mut output = String::new();
     for (_, table) in conversion.detected_tables {
@@ -1511,6 +1850,29 @@ pub(crate) fn complete_table_markdown_from_items(
     output
 }
 
+/// Variant of [`to_markdown_from_items_with_rects_and_lines`] that retains
+/// source structure before the Markdown renderer cleans tables, merges
+/// continuation pages, or joins presentation paragraphs.
+pub(crate) fn to_markdown_from_items_with_rects_and_lines_with_structured_capture(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+    page_geometries: Option<&BTreeMap<u32, PageGeometry>>,
+    render_markdown: bool,
+) -> MarkdownConversionResult {
+    convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown { render_markdown },
+        page_geometries,
+    )
+}
+
 fn convert_items_with_rects_lines_and_table_output(
     items: Vec<TextItem>,
     options: MarkdownOptions,
@@ -1518,7 +1880,8 @@ fn convert_items_with_rects_lines_and_table_output(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
     table_output_mode: TableOutputMode,
-) -> MarkdownConversionOutput {
+    page_geometries: Option<&BTreeMap<u32, PageGeometry>>,
+) -> MarkdownConversionResult {
     use crate::tables::{
         content_width, detect_tables_from_lines, detect_tables_from_rects,
         detect_tables_from_struct_tree, detect_tables_with_page_width, try_build_rect_guided_table,
@@ -1536,8 +1899,16 @@ fn convert_items_with_rects_lines_and_table_output(
     } = context;
 
     if items.is_empty() {
-        return MarkdownConversionOutput::default();
+        return MarkdownConversionResult {
+            markdown: String::new(),
+            blocks_by_page: page_geometries.map(|_| BTreeMap::new()),
+            #[cfg(feature = "ocr")]
+            detected_tables: Vec::new(),
+        };
     }
+
+    let capture_structured_output = page_geometries.is_some();
+    let render_markdown = table_output_mode.render_markdown();
 
     // Table detection must retain the original collection because short
     // numeric table cells can be indistinguishable from folios until
@@ -1629,6 +2000,16 @@ fn convert_items_with_rects_lines_and_table_output(
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
         let page_content_width = content_width(&page_items);
+        // Keep raw tagged-table evidence even when structure-tree detection
+        // later rejects a one-row or partial descriptor. It closes terminal
+        // recovery only for a heuristic candidate that claims tagged items.
+        let raw_struct_mcids: HashSet<i64> = struct_tables
+            .iter()
+            .flat_map(|table| &table.rows)
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| &cell.mcids)
+            .filter_map(|&(mcid, tagged_page)| (tagged_page == page).then_some(mcid))
+            .collect();
 
         // Chart-bar regions: bar charts drawn as filled rects read as cell
         // rects or aligned text and get gridded into phantom tables. Their
@@ -1792,8 +2173,14 @@ fn convert_items_with_rects_lines_and_table_output(
             //    Only use struct-tree tables when they capture a majority (≥50%) of
             //    band items.  Incomplete struct trees (partial tagging) should fall
             //    through to geometry detection which sees all items.
-            if !struct_tables.is_empty() {
-                let st_tables = detect_tables_from_struct_tree(band_items, struct_tables, page);
+            let st_tables = if struct_tables.is_empty() {
+                Vec::new()
+            } else {
+                detect_tables_from_struct_tree(band_items, struct_tables, page)
+            };
+            let heuristic_has_soft_boundary =
+                st_tables.is_empty() && band_rects.is_empty() && band_lines.is_empty();
+            if !st_tables.is_empty() {
                 for table in &st_tables {
                     let coverage = table.item_indices.len() as f32 / band_items.len().max(1) as f32;
                     if coverage < 0.5 {
@@ -1807,7 +2194,14 @@ fn convert_items_with_rects_lines_and_table_output(
                             }
                         }
                     }
-                    table_output.record(page, table, chart_prose_order);
+                    table_output.record(
+                        page,
+                        table,
+                        band_items,
+                        chart_prose_order,
+                        render_markdown,
+                        capture_structured_output,
+                    );
                 }
             }
 
@@ -1831,7 +2225,14 @@ fn convert_items_with_rects_lines_and_table_output(
                         }
                     }
                 }
-                table_output.record(page, table, chart_prose_order);
+                table_output.record(
+                    page,
+                    table,
+                    band_items,
+                    chart_prose_order,
+                    render_markdown,
+                    capture_structured_output,
+                );
             }
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
@@ -1846,7 +2247,14 @@ fn convert_items_with_rects_lines_and_table_output(
                             }
                         }
                     }
-                    table_output.record(page, table, chart_prose_order);
+                    table_output.record(
+                        page,
+                        table,
+                        band_items,
+                        chart_prose_order,
+                        render_markdown,
+                        capture_structured_output,
+                    );
                 }
             }
 
@@ -1882,7 +2290,14 @@ fn convert_items_with_rects_lines_and_table_output(
                                 }
                             }
                         }
-                        table_output.record(page, &table, chart_prose_order);
+                        table_output.record(
+                            page,
+                            &table,
+                            &inside_items,
+                            chart_prose_order,
+                            render_markdown,
+                            capture_structured_output,
+                        );
                         for &band_idx in &inside_map {
                             rect_claimed.insert(band_idx);
                         }
@@ -1892,7 +2307,10 @@ fn convert_items_with_rects_lines_and_table_output(
 
             // 3b. Heuristic fallback on unclaimed items
             let mut run_heuristic =
-                |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
+                |subset_items: &[TextItem],
+                 index_map: &[usize],
+                 min_items: usize,
+                 recover_terminal_rows: bool| {
                     if subset_items.len() < min_items {
                         return;
                     }
@@ -1913,6 +2331,18 @@ fn convert_items_with_rects_lines_and_table_output(
                         page_content_width,
                     );
                     for table in tables {
+                        let candidate_has_raw_struct_evidence =
+                            table.item_indices.iter().any(|&index| {
+                                subset_items
+                                    .get(index)
+                                    .and_then(|item| item.mcid)
+                                    .is_some_and(|mcid| raw_struct_mcids.contains(&mcid))
+                            });
+                        let table = if recover_terminal_rows && !candidate_has_raw_struct_evidence {
+                            table_with_terminal_cell_continuations(&table, subset_items)
+                        } else {
+                            table
+                        };
                         if reject_parallel_prose && is_parallel_prose_table(&table) {
                             log::debug!(
                                 "page {}: rejected {}x{} parallel-prose table hypothesis",
@@ -1940,7 +2370,14 @@ fn convert_items_with_rects_lines_and_table_output(
                                 }
                             }
                         }
-                        table_output.record(page, &table, chart_prose_order);
+                        table_output.record(
+                            page,
+                            &table,
+                            subset_items,
+                            chart_prose_order,
+                            render_markdown,
+                            capture_structured_output,
+                        );
                     }
                 };
 
@@ -1948,7 +2385,7 @@ fn convert_items_with_rects_lines_and_table_output(
             if rect_claimed.is_empty() && hint_regions.is_empty() {
                 // No rect tables or hints — run heuristic on all band items
                 let identity_map: Vec<usize> = (0..band_items.len()).collect();
-                run_heuristic(band_items, &identity_map, 6);
+                run_heuristic(band_items, &identity_map, 6, heuristic_has_soft_boundary);
             } else if rect_claimed.is_empty() && !hint_regions.is_empty() {
                 // No rect tables but hint regions exist — run heuristic separately
                 // on items inside each hint region and on items outside all hints.
@@ -1962,7 +2399,7 @@ fn convert_items_with_rects_lines_and_table_output(
                         })
                         .map(|(idx, item)| (item.clone(), idx))
                         .unzip();
-                    run_heuristic(&inside_items, &inside_map, 6);
+                    run_heuristic(&inside_items, &inside_map, 6, false);
                     for &band_idx in &inside_map {
                         rect_claimed.insert(band_idx);
                     }
@@ -1973,7 +2410,7 @@ fn convert_items_with_rects_lines_and_table_output(
                     .filter(|(idx, _)| !rect_claimed.contains(idx))
                     .map(|(idx, item)| (item.clone(), idx))
                     .unzip();
-                run_heuristic(&outside_items, &outside_map, 6);
+                run_heuristic(&outside_items, &outside_map, 6, false);
             } else {
                 // Rect tables found — run heuristic on unclaimed items
                 let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = band_items
@@ -1982,7 +2419,7 @@ fn convert_items_with_rects_lines_and_table_output(
                     .filter(|(idx, _)| !rect_claimed.contains(idx))
                     .map(|(idx, item)| (item.clone(), idx))
                     .unzip();
-                run_heuristic(&unclaimed_items, &unclaimed_map, 6);
+                run_heuristic(&unclaimed_items, &unclaimed_map, 6, false);
             }
 
             // 4. Column-based table detection for borderless tabular layouts.
@@ -2002,7 +2439,14 @@ fn convert_items_with_rects_lines_and_table_output(
                             }
                         }
                     }
-                    table_output.record(page, &table, chart_prose_order);
+                    table_output.record(
+                        page,
+                        &table,
+                        band_items,
+                        chart_prose_order,
+                        render_markdown,
+                        capture_structured_output,
+                    );
                 }
             }
         }
@@ -2061,7 +2505,14 @@ fn convert_items_with_rects_lines_and_table_output(
                             table_items.insert(global_idx);
                         }
                     }
-                    table_output.record(page, table, chart_prose_order);
+                    table_output.record(
+                        page,
+                        table,
+                        &page_text,
+                        chart_prose_order,
+                        render_markdown,
+                        capture_structured_output,
+                    );
                 }
             }
         }
@@ -2127,7 +2578,14 @@ fn convert_items_with_rects_lines_and_table_output(
                         }
                     }
                 }
-                table_output.record(page, table, chart_prose_order);
+                table_output.record(
+                    page,
+                    table,
+                    &chart_free,
+                    chart_prose_order,
+                    render_markdown,
+                    capture_structured_output,
+                );
             }
         }
     }
@@ -2140,24 +2598,29 @@ fn convert_items_with_rects_lines_and_table_output(
 
     // Images are also removed before line grouping, so give them the same
     // logical chart-page position as tables before reinsertion.
-    let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
-    for img in &images {
-        let img_name = img
-            .text
-            .strip_prefix("[Image: ")
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(&img.text);
-        let img_md = format!("![Image: {}](image)\n", img_name);
+    let page_images = if render_markdown {
+        let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+        for img in &images {
+            let img_name = img
+                .text
+                .strip_prefix("[Image: ")
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(&img.text);
+            let img_md = format!("![Image: {}](image)\n", img_name);
+            page_images
+                .entry(img.page)
+                .or_default()
+                .push(PositionedMarkdown::new(
+                    img.y,
+                    img.x,
+                    img_md,
+                    page_chart_prose_orders.get(&img.page).copied(),
+                ));
+        }
         page_images
-            .entry(img.page)
-            .or_default()
-            .push(PositionedMarkdown::new(
-                img.y,
-                img.x,
-                img_md,
-                page_chart_prose_orders.get(&img.page).copied(),
-            ));
-    }
+    } else {
+        HashMap::new()
+    };
 
     // Check structure tree coverage on ALL text items (before table filtering)
     // to decide whether to use structure-aware markdown generation.
@@ -2200,215 +2663,312 @@ fn convert_items_with_rects_lines_and_table_output(
         .filter(|(idx, _)| !table_items.contains(idx))
         .collect();
 
-    // Find pages that are table-only (no remaining non-table text)
-    let table_only_pages: HashSet<u32> = {
-        let mut pages_with_text: HashSet<u32> =
-            non_table_items.iter().map(|(_, item)| item.page).collect();
-        // Preserve the pre-filter continuation classification: a page that
-        // originally also contained a folio does not become table-only merely
-        // because an upstream document-level pass removed it.
-        pages_with_text.extend(removed_page_number_pages);
-        page_tables
-            .keys()
-            .filter(|p| !pages_with_text.contains(p))
-            .copied()
-            .collect()
-    };
-
-    // Merge continuation tables across page breaks, but only for table-only pages
-    merge_continuation_tables(&mut page_tables, &table_only_pages);
-
-    // Collect pages that have detected tables — used to suppress relative valley
-    // column detection on pages where table column gaps would be misidentified.
-    let table_page_set: HashSet<u32> = page_tables.keys().copied().collect();
-
-    let non_table_items = if has_precomputed_page_number_mask {
-        non_table_items
-            .into_iter()
-            .filter(|(index, _)| !text_item_page_number_mask[*index])
-            .map(|(_, item)| item)
-            .collect()
-    } else {
-        crate::extractor::filter_markdown_page_numbers_with_removed_pages(
-            non_table_items.into_iter().map(|(_, item)| item).collect(),
-            document_page_count,
-        )
-        .0
-    };
-
-    // Split non-table items by band boundaries before line grouping so that
-    // items from different side-by-side zones (e.g. left/right month columns
-    // in a calendar) don't merge into the same line.
-    let lines = if page_band_splits.is_empty() && page_chart_prose_splits.is_empty() {
-        crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
-            non_table_items,
+    // Structured capture deliberately sees page-local raw tables before the
+    // Markdown-only continuation merge removes repeated headers and later-page
+    // fragments. Its non-table lines use the same reading-order helper as the
+    // Markdown renderer, but retain presentation-filtered folios as source text.
+    let structured_table_page_set: HashSet<u32> = page_tables.keys().copied().collect();
+    let structured_blocks = page_geometries.map(|geometries| {
+        let source_lines = group_non_table_items_in_reading_order(
+            non_table_items
+                .iter()
+                .map(|(_, item)| item.clone())
+                .collect(),
+            &page_band_splits,
+            &page_chart_prose_splits,
+            &structured_table_page_set,
             page_thresholds,
-            &table_page_set,
             &page_chart_map,
             &page_image_regions,
+        );
+        capture_structured_blocks(&source_lines, &page_tables, geometries, struct_roles)
+    });
+
+    let markdown = if render_markdown {
+        // Merge continuation tables across page breaks, but only for table-only pages.
+        // This remains a Markdown presentation concern; it cannot affect the raw
+        // structured capture above.
+        let table_only_pages: HashSet<u32> = {
+            let mut pages_with_text: HashSet<u32> =
+                non_table_items.iter().map(|(_, item)| item.page).collect();
+            // Preserve the pre-filter continuation classification: a page that
+            // originally also contained a folio does not become table-only merely
+            // because an upstream document-level pass removed it.
+            pages_with_text.extend(removed_page_number_pages);
+            page_tables
+                .keys()
+                .filter(|p| !pages_with_text.contains(p))
+                .copied()
+                .collect()
+        };
+        merge_continuation_tables(&mut page_tables, &table_only_pages);
+
+        // Collect pages that have detected tables — used to suppress relative valley
+        // column detection on pages where table column gaps would be misidentified.
+        let table_page_set: HashSet<u32> = page_tables.keys().copied().collect();
+        let non_table_items = if has_precomputed_page_number_mask {
+            non_table_items
+                .into_iter()
+                .filter(|(index, _)| !text_item_page_number_mask[*index])
+                .map(|(_, item)| item)
+                .collect()
+        } else {
+            crate::extractor::filter_markdown_page_numbers_with_removed_pages(
+                non_table_items.into_iter().map(|(_, item)| item).collect(),
+                document_page_count,
+            )
+            .0
+        };
+        let lines = group_non_table_items_in_reading_order(
+            non_table_items,
+            &page_band_splits,
+            &page_chart_prose_splits,
+            &table_page_set,
+            page_thresholds,
+            &page_chart_map,
+            &page_image_regions,
+        );
+        let lines = if options.strip_headers_footers {
+            furniture::strip_header_footer_lines(lines, document_page_count)
+        } else {
+            lines
+        };
+        let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
+        band_split_page_set.extend(page_chart_prose_splits.keys().copied());
+        to_markdown_from_lines_with_tables_and_images(
+            lines,
+            options,
+            page_tables,
+            page_images,
+            &page_chart_map,
+            &band_split_page_set,
+            effective_struct_roles,
         )
     } else {
-        // Separate items into physical-band pages, chart/prose pages, and
-        // ordinary pages. Chart/prose pages need a different reading order:
-        // each chart is a full-width separator, while prose above and below
-        // it reads down the left column and then down the right column.
-        let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
-        let mut chart_prose_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
-        let mut unsplit_items: Vec<TextItem> = Vec::new();
-        for item in non_table_items {
-            if page_chart_prose_splits.contains_key(&item.page) {
-                chart_prose_page_items
-                    .entry(item.page)
-                    .or_default()
-                    .push(item);
-            } else if page_band_splits.contains_key(&item.page) {
-                split_page_items.entry(item.page).or_default().push(item);
-            } else {
-                unsplit_items.push(item);
+        String::new()
+    };
+    MarkdownConversionResult {
+        markdown,
+        blocks_by_page: structured_blocks,
+        #[cfg(feature = "ocr")]
+        detected_tables,
+    }
+}
+
+/// Group non-table text with the exact page/band/chart reading-order path
+/// shared by Markdown and structured output. The caller controls only whether
+/// presentation filtering has already removed anything from `items`.
+#[allow(clippy::too_many_arguments)]
+fn group_non_table_items_in_reading_order(
+    items: Vec<TextItem>,
+    page_band_splits: &HashMap<u32, Vec<(f32, f32)>>,
+    page_chart_prose_splits: &HashMap<u32, f32>,
+    table_page_set: &HashSet<u32>,
+    page_thresholds: &HashMap<u32, f32>,
+    page_chart_map: &PageChartRegions,
+    page_image_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+) -> Vec<TextLine> {
+    if page_band_splits.is_empty() && page_chart_prose_splits.is_empty() {
+        return crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
+            items,
+            page_thresholds,
+            table_page_set,
+            page_chart_map,
+            page_image_regions,
+        );
+    }
+
+    // Separate items into physical-band pages, chart/prose pages, and ordinary
+    // pages. Chart/prose pages read each prose zone by column around the chart.
+    let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut chart_prose_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut unsplit_items: Vec<TextItem> = Vec::new();
+    for item in items {
+        if page_chart_prose_splits.contains_key(&item.page) {
+            chart_prose_page_items
+                .entry(item.page)
+                .or_default()
+                .push(item);
+        } else if page_band_splits.contains_key(&item.page) {
+            split_page_items.entry(item.page).or_default().push(item);
+        } else {
+            unsplit_items.push(item);
+        }
+    }
+    let mut all_lines =
+        crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
+            unsplit_items,
+            page_thresholds,
+            table_page_set,
+            page_chart_map,
+            page_image_regions,
+        );
+
+    let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
+    split_pages.sort();
+    for page in split_pages {
+        let items = split_page_items.remove(&page).unwrap_or_default();
+        let bands = &page_band_splits[&page];
+        let mut page_lines = Vec::new();
+        for &(x_lo, x_hi) in bands {
+            let margin = 2.0;
+            let band_items: Vec<TextItem> = items
+                .iter()
+                .filter(|item| item.x >= x_lo - margin && item.x < x_hi + margin)
+                .cloned()
+                .collect();
+            if !band_items.is_empty() {
+                page_lines.extend(
+                    crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+                        band_items,
+                        page_thresholds,
+                        table_page_set,
+                        page_chart_map,
+                    ),
+                );
             }
         }
-        // Process unsplit pages normally
-        let mut all_lines =
-            crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
-                unsplit_items,
-                page_thresholds,
-                &table_page_set,
-                &page_chart_map,
-                &page_image_regions,
-            );
-        // Process each split page's bands independently, then interleave
-        // by Y position so paired zones (e.g. left/right months) appear together.
-        let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
-        split_pages.sort();
-        for page in split_pages {
-            let items = split_page_items.remove(&page).unwrap();
-            let bands = &page_band_splits[&page];
-            let mut page_lines: Vec<crate::types::TextLine> = Vec::new();
-            for &(x_lo, x_hi) in bands {
-                let margin = 2.0;
-                let band_items: Vec<TextItem> = items
+        page_lines.sort_by(|left: &TextLine, right: &TextLine| right.y.total_cmp(&left.y));
+        all_lines.extend(page_lines);
+    }
+
+    let mut chart_prose_pages: Vec<u32> = chart_prose_page_items.keys().copied().collect();
+    chart_prose_pages.sort();
+    for page in chart_prose_pages {
+        let mut remaining = chart_prose_page_items.remove(&page).unwrap_or_default();
+        let split_x = page_chart_prose_splits[&page];
+        let chart_regions = &page_chart_map[&page];
+        let group_prose_zone = |zone_items: Vec<TextItem>| {
+            let mut zone_lines = Vec::new();
+            for right_column in [false, true] {
+                let column_items: Vec<TextItem> = zone_items
                     .iter()
-                    .filter(|i| i.x >= x_lo - margin && i.x < x_hi + margin)
+                    .filter(|item| (item.x >= split_x) == right_column)
                     .cloned()
                     .collect();
-                if !band_items.is_empty() {
-                    page_lines.extend(
+                if !column_items.is_empty() {
+                    zone_lines.extend(
                         crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
-                            band_items,
+                            column_items,
                             page_thresholds,
-                            &table_page_set,
-                            &page_chart_map,
+                            table_page_set,
+                            page_chart_map,
                         ),
                     );
                 }
             }
-            // Sort by Y descending (top to bottom) so left and right
-            // band lines interleave in visual reading order.
-            page_lines.sort_by(|a, b| b.y.total_cmp(&a.y));
-            all_lines.extend(page_lines);
+            zone_lines
+        };
+
+        let mut chart_y_bands: Vec<(f32, f32)> = page_chart_map[&page]
+            .iter()
+            .map(|&(_, y0, _, y1)| (y0 - CHART_SEPARATOR_PAD, y1 + CHART_SEPARATOR_PAD))
+            .collect();
+        chart_y_bands.sort_by(|left, right| right.1.total_cmp(&left.1));
+        let mut merged_chart_y_bands: Vec<(f32, f32)> = Vec::new();
+        for (low, high) in chart_y_bands {
+            if let Some(last) = merged_chart_y_bands.last_mut() {
+                if high >= last.0 {
+                    last.0 = last.0.min(low);
+                    last.1 = last.1.max(high);
+                    continue;
+                }
+            }
+            merged_chart_y_bands.push((low, high));
         }
 
-        // Process chart/prose pages as alternating vertical zones. Within a
-        // prose zone, group each column independently and append columns in
-        // newspaper order. Within a chart zone, group the full width normally.
-        let mut chart_prose_pages: Vec<u32> = chart_prose_page_items.keys().copied().collect();
-        chart_prose_pages.sort();
-        for page in chart_prose_pages {
-            let mut remaining = chart_prose_page_items.remove(&page).unwrap();
-            let split_x = page_chart_prose_splits[&page];
-            let chart_regions = &page_chart_map[&page];
-            let group_prose_zone = |zone_items: Vec<TextItem>| {
-                let mut zone_lines = Vec::new();
-                for right_column in [false, true] {
-                    let column_items: Vec<TextItem> = zone_items
-                        .iter()
-                        .filter(|item| (item.x >= split_x) == right_column)
-                        .cloned()
-                        .collect();
-                    if !column_items.is_empty() {
-                        zone_lines.extend(
-                            crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
-                                column_items,
-                                page_thresholds,
-                                &table_page_set,
-                                &page_chart_map,
-                            ),
-                        );
-                    }
-                }
-                zone_lines
-            };
-
-            let mut chart_y_bands: Vec<(f32, f32)> = page_chart_map[&page]
-                .iter()
-                .map(|&(_, y0, _, y1)| (y0 - CHART_SEPARATOR_PAD, y1 + CHART_SEPARATOR_PAD))
-                .collect();
-            chart_y_bands.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let mut merged_chart_y_bands: Vec<(f32, f32)> = Vec::new();
-            for (low, high) in chart_y_bands {
-                if let Some(last) = merged_chart_y_bands.last_mut() {
-                    if high >= last.0 {
-                        last.0 = last.0.min(low);
-                        last.1 = last.1.max(high);
-                        continue;
-                    }
-                }
-                merged_chart_y_bands.push((low, high));
-            }
-
-            for (low, high) in merged_chart_y_bands {
-                let (above, at_or_below): (Vec<TextItem>, Vec<TextItem>) =
-                    remaining.into_iter().partition(|item| {
-                        item.y > high && !item_is_in_chart_region(item, chart_regions)
-                    });
-                all_lines.extend(group_prose_zone(above));
-
-                let (chart_zone, below): (Vec<TextItem>, Vec<TextItem>) =
-                    at_or_below.into_iter().partition(|item| {
-                        item.y >= low || item_is_in_chart_region(item, chart_regions)
-                    });
-                all_lines.extend(
-                    crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
-                        chart_zone,
-                        page_thresholds,
-                        &table_page_set,
-                        &page_chart_map,
-                    ),
-                );
-                remaining = below;
-            }
-            all_lines.extend(group_prose_zone(remaining));
+        for (low, high) in merged_chart_y_bands {
+            let (above, at_or_below): (Vec<TextItem>, Vec<TextItem>) = remaining
+                .into_iter()
+                .partition(|item| item.y > high && !item_is_in_chart_region(item, chart_regions));
+            all_lines.extend(group_prose_zone(above));
+            let (chart_zone, below): (Vec<TextItem>, Vec<TextItem>) = at_or_below
+                .into_iter()
+                .partition(|item| item.y >= low || item_is_in_chart_region(item, chart_regions));
+            all_lines.extend(
+                crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+                    chart_zone,
+                    page_thresholds,
+                    table_page_set,
+                    page_chart_map,
+                ),
+            );
+            remaining = below;
         }
-        // The three processing paths above are accumulated separately. Restore
-        // document page order while preserving each page's chosen line order.
-        all_lines.sort_by_key(|line| line.page);
-        all_lines
-    };
-
-    // Strip repeated headers/footers before conversion
-    let lines = if options.strip_headers_footers {
-        furniture::strip_header_footer_lines(lines, document_page_count)
-    } else {
-        lines
-    };
-
-    // Convert to markdown, inserting tables and images at appropriate positions
-    let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
-    band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-    let markdown = to_markdown_from_lines_with_tables_and_images(
-        lines,
-        options,
-        page_tables,
-        page_images,
-        &page_chart_map,
-        &band_split_page_set,
-        effective_struct_roles,
-    );
-    MarkdownConversionOutput {
-        markdown,
-        #[cfg(feature = "ocr")]
-        detected_tables,
+        all_lines.extend(group_prose_zone(remaining));
     }
+
+    // The processing paths above are accumulated separately. Restore document
+    // page order while preserving each page's selected internal line order.
+    all_lines.sort_by_key(|line| line.page);
+    all_lines
+}
+
+fn capture_structured_blocks(
+    lines: &[TextLine],
+    page_tables: &HashMap<u32, Vec<PositionedMarkdown>>,
+    page_geometries: &BTreeMap<u32, PageGeometry>,
+    struct_roles: Option<&HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
+) -> BTreeMap<u32, Vec<StructuredBlock>> {
+    let mut pages: Vec<u32> = lines.iter().map(|line| line.page).collect();
+    pages.extend(page_tables.keys().copied());
+    pages.sort_unstable();
+    pages.dedup();
+
+    let mut blocks_by_page = BTreeMap::new();
+    for page in pages {
+        let Some(&geometry) = page_geometries.get(&page) else {
+            continue;
+        };
+        let page_lines: Vec<&TextLine> = lines.iter().filter(|line| line.page == page).collect();
+        let tables = positioned_tables_for_page(page, page_tables);
+        let mut inserted_tables = HashSet::new();
+        let mut pending_lines: Vec<TextLine> = Vec::new();
+        let mut blocks = Vec::new();
+        let flush_lines = |blocks: &mut Vec<StructuredBlock>, lines: &mut Vec<TextLine>| {
+            if !lines.is_empty() {
+                blocks.push(structured::text_block(lines, geometry));
+                lines.clear();
+            }
+        };
+        let captured_table_block = |capture: &convert::CapturedTable| {
+            if capture.table.cells.is_empty()
+                || capture.table.cells.iter().all(|row| row.is_empty())
+            {
+                structured::text_block_from_items(&capture.source_items, geometry)
+            } else {
+                structured::table_block(
+                    &capture.table,
+                    &capture.source_items,
+                    geometry,
+                    struct_roles,
+                )
+            }
+        };
+        for line in page_lines {
+            for (index, table) in &tables {
+                if !inserted_tables.contains(index) && positioned_block_precedes_line(table, line) {
+                    flush_lines(&mut blocks, &mut pending_lines);
+                    if let Some(capture) = &table.captured_table {
+                        blocks.push(captured_table_block(capture));
+                    }
+                    inserted_tables.insert(*index);
+                }
+            }
+            pending_lines.push(line.clone());
+        }
+        flush_lines(&mut blocks, &mut pending_lines);
+        for (index, table) in tables {
+            if inserted_tables.insert(index) {
+                if let Some(capture) = &table.captured_table {
+                    blocks.push(captured_table_block(capture));
+                }
+            }
+        }
+        structured::assign_block_ids(page, &mut blocks);
+        blocks_by_page.insert(page, blocks);
+    }
+    blocks_by_page
 }
 
 #[cfg(test)]
@@ -2427,7 +2987,7 @@ mod tests {
             vec![vec!["header a".into(), "header b".into()]],
             vec![0, 1],
         );
-        output.record(1, &incomplete, None);
+        output.record(1, &incomplete, &[], None, false, false);
         assert!(output.has_detected_tables_on_page(1));
         assert!(!output.has_tables_on_page(1));
         assert!(output.complete_tables.is_empty());
@@ -2441,7 +3001,7 @@ mod tests {
             ],
             vec![0, 1, 2, 3],
         );
-        output.record(1, &complete, None);
+        output.record(1, &complete, &[], None, false, false);
         assert!(output.has_tables_on_page(1));
         assert_eq!(output.complete_tables.len(), 1);
     }
@@ -2589,6 +3149,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: (0..detection_items.len()).collect(),
+            spans: vec![],
             kind: crate::tables::TableKind::Data,
         };
 
@@ -3506,5 +4067,97 @@ mod tests {
             split.is_empty(),
             "label+number table should not be split side-by-side"
         );
+    }
+
+    #[test]
+    fn structured_capture_uses_the_renderer_table_text_interleave() {
+        let mut table_item = make_item(50.0, 500.0, 1);
+        table_item.text = "Table cell".into();
+        let table = crate::tables::Table::new(
+            vec![50.0],
+            vec![500.0],
+            vec![vec!["Table cell".into()]],
+            vec![0],
+        );
+        let positioned = PositionedMarkdown::table(
+            500.0,
+            50.0,
+            String::new(),
+            None,
+            &table,
+            &[table_item],
+            true,
+        );
+        let mut page_tables = HashMap::new();
+        page_tables.insert(1, vec![positioned]);
+        let mut geometries = BTreeMap::new();
+        geometries.insert(1, crate::structured::test_page_geometry());
+
+        let mut above = make_item(50.0, 600.0, 1);
+        above.text = "Above table".into();
+        let mut below = make_item(50.0, 400.0, 1);
+        below.text = "Below table".into();
+        let lines = vec![
+            TextLine {
+                y: above.y,
+                page: 1,
+                items: vec![above],
+                adaptive_threshold: 0.1,
+            },
+            TextLine {
+                y: below.y,
+                page: 1,
+                items: vec![below],
+                adaptive_threshold: 0.1,
+            },
+        ];
+
+        let mut blocks_by_page = capture_structured_blocks(&lines, &page_tables, &geometries, None);
+        let blocks = blocks_by_page.remove(&1).expect("page blocks");
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(
+            &blocks[0].content,
+            crate::structured::StructuredBlockContent::Text { .. }
+        ));
+        assert!(matches!(
+            &blocks[1].content,
+            crate::structured::StructuredBlockContent::Table { .. }
+        ));
+        assert!(matches!(
+            &blocks[2].content,
+            crate::structured::StructuredBlockContent::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn merged_retry_capture_keeps_detector_local_chart_free_item_mapping() {
+        let mut chart_item = make_item(50.0, 500.0, 1);
+        chart_item.text = "Chart label".into();
+        let mut table_item = make_item(50.0, 500.0, 1);
+        table_item.text = "Statement cell".into();
+
+        // A merged retry removes the chart item before detection. The table's
+        // local index zero must therefore resolve to `Statement cell`, not the
+        // first item in the unfiltered band.
+        let _unfiltered_band = [chart_item, table_item.clone()];
+        let chart_free = vec![table_item];
+        let table = crate::tables::Table::new(
+            vec![50.0],
+            vec![500.0],
+            vec![vec!["Statement cell".into()]],
+            vec![0],
+        );
+        let positioned = positioned_table(&table, &chart_free, None, true, true);
+        let capture = positioned.captured_table.expect("structured capture");
+        let block = crate::structured::table_block(
+            &capture.table,
+            &capture.source_items,
+            crate::structured::test_page_geometry(),
+            None,
+        );
+        let crate::structured::StructuredBlockContent::Table { cells, .. } = block.content else {
+            panic!("expected a table block");
+        };
+        assert_eq!(cells[0].lines[0].text, "Statement cell");
     }
 }
